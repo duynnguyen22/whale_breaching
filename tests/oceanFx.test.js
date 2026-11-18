@@ -5,6 +5,7 @@ import {
   createPolarOceanGeometry,
   createOceanSurface,
   evaluateShaderOceanHeightFromUniforms,
+  evaluateSubsurfaceWhaleOptics,
 } from '../src/ocean/oceanSurface.js';
 import { WAVE_COMPONENTS, evaluateOceanHeight } from '../src/math/oceanMath.js';
 import {
@@ -468,6 +469,362 @@ describe('splashSystem', () => {
     }
     expect(activeAboveDome).toBeGreaterThan(20);
   });
+
+  it('exposes velocity-stretched liquid spray attribute (aVelocity) updated across spawn, ballistic integration, and deactivation', () => {
+    const splash = createSplashSystem();
+    const sprayPoints = splash.group.getObjectByName('sprayParticles');
+    const posAttr = sprayPoints.geometry.getAttribute('position');
+    const alphaAttr = sprayPoints.geometry.getAttribute('aAlpha');
+    const velAttr = sprayPoints.geometry.getAttribute('aVelocity');
+
+    expect(velAttr).toBeDefined();
+    expect(velAttr.itemSize).toBe(3);
+    expect(velAttr.count).toBe(posAttr.count);
+
+    // Shader projects aVelocity into view/screen space to stretch fast spray into liquid ligaments
+    expect(sprayPoints.material.vertexShader).toContain('attribute vec3 aVelocity');
+    expect(sprayPoints.material.vertexShader).toContain('vScreenVelDir');
+    expect(sprayPoints.material.vertexShader).toContain('vStretch');
+    expect(sprayPoints.material.fragmentShader).toContain('vScreenVelDir');
+    expect(sprayPoints.material.fragmentShader).toContain('vStretch');
+
+    splash.triggerSplashdown({ x: 0, z: 0, startTime: 1.0, strength: 1.75 });
+
+    let fastCount = 0;
+    let initialMeanVy = 0;
+    let activeCount = 0;
+    for (let i = 0; i < alphaAttr.count; i++) {
+      if (alphaAttr.getX(i) > 0.01) {
+        activeCount++;
+        const vx = velAttr.getX(i);
+        const vy = velAttr.getY(i);
+        const vz = velAttr.getZ(i);
+        initialMeanVy += vy;
+        if (Math.hypot(vx, vy, vz) > 9.0) fastCount++;
+      }
+    }
+    expect(activeCount).toBeGreaterThan(500);
+    expect(fastCount).toBeGreaterThan(250);
+    initialMeanVy /= activeCount;
+
+    // Step forward 0.4s: gravity & drag update aVelocity in-place
+    for (let step = 0; step < 8; step++) {
+      splash.update({ dt: 0.05, time: 1.05 + step * 0.05, getWaterHeight: () => 0 });
+    }
+
+    let laterMeanVy = 0;
+    let laterActive = 0;
+    for (let i = 0; i < alphaAttr.count; i++) {
+      if (alphaAttr.getX(i) > 0.01) {
+        laterActive++;
+        laterMeanVy += velAttr.getY(i);
+      } else {
+        expect(velAttr.getX(i)).toBe(0);
+        expect(velAttr.getY(i)).toBe(0);
+        expect(velAttr.getZ(i)).toBe(0);
+      }
+    }
+    expect(laterActive).toBeGreaterThan(200);
+    laterMeanVy /= laterActive;
+    expect(laterMeanVy).toBeLessThan(initialMeanVy - 2.0);
+  });
+
+  it('streams continuous full-wing water curtains along 4.6m pectoral wing & 4.5m fluke trailing arrays while suppressing submerged stations', () => {
+    const splash = createSplashSystem();
+    const sprayPoints = splash.group.getObjectByName('sprayParticles');
+    const alphaAttr = sprayPoints.geometry.getAttribute('aAlpha');
+    const posAttr = sprayPoints.geometry.getAttribute('position');
+
+    // Left wing airborne (y = 3.8..5.0), Right wing outer half dipped below water (y = -0.5), Flukes airborne
+    const flipperTrailingL = Array.from({ length: 6 }, (_, i) => ({
+      x: -1.1 - (i / 5) * 3.7,
+      y: 3.8 + (i / 5) * 1.2,
+      z: 1.4 - (i / 5) * 0.6,
+      radius: 0.48 - i * 0.04,
+    }));
+    const flipperTrailingR = Array.from({ length: 6 }, (_, i) => ({
+      x: 1.1 + (i / 5) * 3.7,
+      y: i < 2 ? 2.2 : -0.6, // outer stations 2..5 submerged below waterY = 0
+      z: 1.4 - (i / 5) * 0.6,
+      radius: 0.48 - i * 0.04,
+    }));
+    const flukeTrailing = Array.from({ length: 5 }, (_, i) => ({
+      x: -2.25 + (i / 4) * 4.5,
+      y: 3.2,
+      z: -6.8,
+      radius: 0.35,
+    }));
+
+    for (let step = 0; step < 4; step++) {
+      splash.update({
+        dt: 0.05,
+        time: 3.0 + step * 0.05,
+        breachState: {
+          bodyShedIntensity: 0.95,
+          emergenceIntensity: 0,
+          splashdownIntensity: 0,
+          velocity: { x: 0, y: 1.2, z: 4.5 },
+          waterDome: { x: 0, z: 0, radius: 4.8, height: 0 },
+        },
+        whaleAnchors: {
+          chin: { x: 0, y: 4.2, z: 4.8 },
+          flipperTrailingL,
+          flipperTrailingR,
+          flukeTrailing,
+          spineStations: [],
+        },
+        getWaterHeight: () => 0,
+      });
+    }
+
+    let leftInner = 0;
+    let leftMid = 0;
+    let leftOuter = 0;
+    let rightSubmergedOuter = 0;
+    let flukeSpanCount = 0;
+
+    for (let i = 0; i < alphaAttr.count; i++) {
+      if (alphaAttr.getX(i) > 0.01) {
+        const x = posAttr.getX(i);
+        const y = posAttr.getY(i);
+        const z = posAttr.getZ(i);
+        expect(y).toBeGreaterThan(0);
+
+        if (z > 0.2 && z < 2.2) {
+          if (x < -1.0 && x >= -2.4) leftInner++;
+          if (x < -2.4 && x >= -3.6) leftMid++;
+          if (x < -3.6) leftOuter++;
+          if (x > 3.2) rightSubmergedOuter++;
+        }
+        if (z < -5.5) flukeSpanCount++;
+      }
+    }
+
+    // Continuous curtain populates inner, mid, AND outer span of the 4.6m airborne wing
+    expect(leftInner).toBeGreaterThan(3);
+    expect(leftMid).toBeGreaterThan(3);
+    expect(leftOuter).toBeGreaterThan(3);
+    expect(flukeSpanCount).toBeGreaterThan(8);
+    // Submerged right outer wing stations do not emit airborne shedding
+    expect(rightSubmergedOuter).toBe(0);
+  });
+
+  it('spawns an elongated 15m body-slam splashdown trench with lateral curtains, cavitation cylinder, and staggered foam rings when spineStations are provided', () => {
+    const splashPoint = createSplashSystem();
+    splashPoint.triggerSplashdown({ x: 0, z: 9.0, startTime: 5.0, strength: 1.75 });
+
+    const splashTrench = createSplashSystem();
+    const spineStations = Array.from({ length: 8 }, (_, i) => ({
+      x: 0.2,
+      y: -0.2,
+      z: 2.0 + (i / 7) * 14.6, // ~14.6m longitudinal slam from z=2.0 to z=16.6
+      radius: [0.42, 0.75, 1.25, 1.58, 1.52, 1.22, 0.88, 0.52][i],
+    }));
+    splashTrench.triggerSplashdown({
+      x: 0.2,
+      z: 9.3,
+      startTime: 5.0,
+      strength: 1.75,
+      spineStations,
+    });
+
+    const measureZSpan = (splashInstance, objName) => {
+      const pts = splashInstance.group.getObjectByName(objName);
+      const alpha = pts.geometry.getAttribute('aAlpha');
+      const pos = pts.geometry.getAttribute('position');
+      const vel = pts.geometry.getAttribute('aVelocity');
+      let minZ = Infinity;
+      let maxZ = -Infinity;
+      let portLateral = 0;
+      let starboardLateral = 0;
+      for (let i = 0; i < alpha.count; i++) {
+        if (alpha.getX(i) > 0.01) {
+          const z = pos.getZ(i);
+          if (z < minZ) minZ = z;
+          if (z > maxZ) maxZ = z;
+          if (vel && vel.getX(i) < -2.5) portLateral++;
+          if (vel && vel.getX(i) > 2.5) starboardLateral++;
+        }
+      }
+      return { spanZ: maxZ - minZ, portLateral, starboardLateral };
+    };
+
+    const pointSpray = measureZSpan(splashPoint, 'sprayParticles');
+    const trenchSpray = measureZSpan(splashTrench, 'sprayParticles');
+    const trenchBubbles = measureZSpan(splashTrench, 'cavitationBubbles');
+
+    expect(trenchSpray.spanZ).toBeGreaterThan(13.5);
+    expect(trenchSpray.spanZ).toBeGreaterThan(pointSpray.spanZ + 6.0);
+    expect(trenchSpray.portLateral).toBeGreaterThan(80);
+    expect(trenchSpray.starboardLateral).toBeGreaterThan(80);
+    expect(trenchBubbles.spanZ).toBeGreaterThan(12.5);
+
+    // Staggered wave-hugging foam patches span the 15m impact scar
+    splashTrench.update({ dt: 0.05, time: 5.1, getWaterHeight: () => 0.15 });
+    const foamGroup = splashTrench.group.getObjectByName('foamRings');
+    const activeFoams = foamGroup.children.filter((m) => m.visible);
+    expect(activeFoams.length).toBeGreaterThanOrEqual(3);
+    const foamZs = activeFoams.map((m) => m.position.z);
+    expect(Math.max(...foamZs) - Math.min(...foamZs)).toBeGreaterThan(8.5);
+  });
+
+  it('shoots a backlit V-shaped blowhole mist spout (< 3000 pool) via triggerSpout and continuous blowIntensity > 0.02 above waterY', () => {
+    const splash = createSplashSystem();
+    expect(typeof splash.triggerSpout).toBe('function');
+
+    const spoutPoints = splash.group.getObjectByName('blowholeSpout');
+    expect(spoutPoints).toBeDefined();
+    expect(spoutPoints.isPoints).toBe(true);
+
+    const spoutPos = spoutPoints.geometry.getAttribute('position');
+    const spoutAlpha = spoutPoints.geometry.getAttribute('aAlpha');
+    const spoutSize = spoutPoints.geometry.getAttribute('aSize');
+    expect(spoutPos.count).toBeGreaterThanOrEqual(400);
+    expect(spoutPos.count).toBeLessThan(3000);
+
+    const countActiveSpout = () => {
+      let n = 0;
+      for (let i = 0; i < spoutAlpha.count; i++) {
+        if (spoutAlpha.getX(i) > 0.01) n++;
+      }
+      return n;
+    };
+
+    // 1. Submerged blowhole (y <= waterY) must NOT emit mist spout even when blowIntensity is high
+    splash.update({
+      dt: 0.05,
+      time: 1.0,
+      breachState: { blowIntensity: 0.95 },
+      whaleAnchors: {
+        blowhole: { x: 0, y: -0.25, z: 3.5 },
+        upDir: { x: 0, y: 1, z: 0 },
+        spineStations: [],
+      },
+      getWaterHeight: () => 0.0,
+    });
+    expect(countActiveSpout()).toBe(0);
+
+    // 2. Surfaced blowhole (y > waterY) with blowIntensity > 0.02 + triggerSpout shoots tall V-plume that expands & drifts with wind
+    splash.triggerSpout({
+      position: { x: 0, y: 0.65, z: 3.5 },
+      upDir: { x: 0, y: 1, z: 0 },
+      intensity: 1.0,
+    });
+
+    for (let step = 0; step < 5; step++) {
+      splash.update({
+        dt: 0.05,
+        time: 1.05 + step * 0.05,
+        breachState: { blowIntensity: 0.88 },
+        whaleAnchors: {
+          blowhole: { x: 0, y: 0.65, z: 3.5 },
+          upDir: { x: 0, y: 1, z: 0 },
+          flipperL: { x: -4.2, y: -1.2, z: 1.0 },
+          flipperR: { x: 4.2, y: -1.2, z: 1.0 },
+          spineStations: [],
+        },
+        getWaterHeight: () => 0.0,
+        sunDirection: new THREE.Vector3(0.4, 0.3, -0.86).normalize(),
+      });
+    }
+
+    let earlyMeanX = 0;
+    let earlyMeanSize = 0;
+    let earlyCount = 0;
+    let negLobe = 0;
+    let posLobe = 0;
+    for (let i = 0; i < spoutAlpha.count; i++) {
+      if (spoutAlpha.getX(i) > 0.01) {
+        earlyCount++;
+        const x = spoutPos.getX(i);
+        earlyMeanX += x;
+        earlyMeanSize += spoutSize.getX(i);
+        if (x < -0.05) negLobe++;
+        if (x > 0.05) posLobe++;
+      }
+    }
+    expect(earlyCount).toBeGreaterThan(80);
+    expect(negLobe).toBeGreaterThan(15);
+    expect(posLobe).toBeGreaterThan(15);
+    earlyMeanX /= earlyCount;
+    earlyMeanSize /= earlyCount;
+
+    // Advance 1.1s without new emission: plume rises > 3.5m, expands significantly, and drifts downwind (+X)
+    let peakSpoutY = 0;
+    for (let step = 0; step < 22; step++) {
+      splash.update({
+        dt: 0.05,
+        time: 1.35 + step * 0.05,
+        breachState: { blowIntensity: 0 },
+        whaleAnchors: { spineStations: [] },
+        getWaterHeight: () => 0.0,
+      });
+      for (let i = 0; i < spoutAlpha.count; i++) {
+        if (spoutAlpha.getX(i) > 0.01 && spoutPos.getY(i) > peakSpoutY) {
+          peakSpoutY = spoutPos.getY(i);
+        }
+      }
+    }
+
+    let lateMeanX = 0;
+    let lateMeanSize = 0;
+    let lateCount = 0;
+    for (let i = 0; i < spoutAlpha.count; i++) {
+      if (spoutAlpha.getX(i) > 0.01) {
+        lateCount++;
+        lateMeanX += spoutPos.getX(i);
+        lateMeanSize += spoutSize.getX(i);
+      }
+    }
+    expect(peakSpoutY).toBeGreaterThan(3.8);
+    expect(lateCount).toBeGreaterThan(30);
+    expect(lateMeanSize / lateCount).toBeGreaterThan(earlyMeanSize * 1.6);
+    expect(lateMeanX / lateCount).toBeGreaterThan(earlyMeanX + 0.45);
+  });
+
+  it('dynamically aligns and shears underwater god rays to Snell-refracted sunDirection while keeping Box3 strictly submerged', () => {
+    const splash = createSplashSystem();
+    const sunbeams = splash.group.getObjectByName('underwaterSunbeams');
+    expect(sunbeams).toBeDefined();
+
+    const sunEast = new THREE.Vector3(0.78, 0.25, -0.57).normalize();
+    splash.update({ dt: 1 / 60, time: 1.0, sunDirection: sunEast });
+    const refractedEast = sunbeams.userData.refractedDirection.clone();
+    const shearEastX = sunbeams.children[0].userData.worldShear.x;
+
+    for (const shaft of sunbeams.children) {
+      shaft.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(shaft);
+      expect(box.max.y).toBeLessThanOrEqual(0.05);
+      expect(box.min.y).toBeLessThan(-8);
+    }
+
+    // Flip sun to West + low twilight elevation and high noon
+    const sunWest = new THREE.Vector3(-0.82, 0.12, 0.56).normalize();
+    splash.update({ dt: 1 / 60, time: 2.0, sunDirection: sunWest });
+    const refractedWest = sunbeams.userData.refractedDirection.clone();
+    const shearWestX = sunbeams.children[0].userData.worldShear.x;
+
+    // Incident sunlight from +X refracts toward -X underwater; incident from -X refracts toward +X
+    expect(refractedEast.x).toBeLessThan(-0.2);
+    expect(refractedWest.x).toBeGreaterThan(0.2);
+    expect(Math.sign(shearEastX)).toBe(-1);
+    expect(Math.sign(shearWestX)).toBe(1);
+
+    for (const sunDir of [
+      sunWest,
+      new THREE.Vector3(0.05, 0.98, 0.18).normalize(),
+      new THREE.Vector3(0.95, 0.02, -0.31).normalize(),
+    ]) {
+      splash.update({ dt: 1 / 60, time: 3.0, sunDirection: sunDir });
+      for (const shaft of sunbeams.children) {
+        shaft.updateMatrixWorld(true);
+        const box = new THREE.Box3().setFromObject(shaft);
+        expect(box.max.y).toBeLessThanOrEqual(0.05);
+        expect(box.min.y).toBeLessThan(-8);
+      }
+    }
+  });
 });
 
 describe('oceanSurface', () => {
@@ -712,5 +1069,160 @@ describe('oceanSurface', () => {
     expect(peakActiveSpray).toBeGreaterThan(400);
     expect(peakActiveBubbles).toBeGreaterThan(80);
     expect(ocean.ripples.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('populates uWhaleSpine[8], uWhaleFlippers[6], and uWhalePresent with both trailing wing arrays and flipperL/flipperR fallback', () => {
+    const ocean = createOceanSurface();
+    const { uniforms, fragmentShader } = ocean.material;
+
+    expect(uniforms.uWhaleSpine.value).toHaveLength(8);
+    expect(uniforms.uWhaleFlippers.value).toHaveLength(6);
+    expect(uniforms.uWhalePresent.value).toBe(0);
+
+    // Verify GLSL above-water refracted subsurface silhouette & turquoise-white wing glow
+    expect(fragmentShader).toContain('uniform vec4 uWhaleSpine[8]');
+    expect(fragmentShader).toContain('uniform vec4 uWhaleFlippers[6]');
+    expect(fragmentShader).toContain('uniform float uWhalePresent');
+    expect(fragmentShader).toContain('refract(-V, N, 0.75)');
+    expect(fragmentShader).toContain('0.784, 0.957, 0.941'); // #c8f4f0 near-surface white-aqua
+    expect(fragmentShader).toContain('0.220, 0.839, 0.784'); // #38d6c8 turquoise wing glow
+
+    // 1. Populate with full flipperTrailingL[6] & flipperTrailingR[6]
+    const spineStations = Array.from({ length: 8 }, (_, i) => ({
+      x: 0.1 * i,
+      y: -2.4,
+      z: -6.0 + i * 1.8,
+      radius: 0.5 + 0.12 * i,
+    }));
+    const flipperTrailingL = Array.from({ length: 6 }, (_, i) => ({
+      x: -1.2 - i * 0.68,
+      y: -1.8,
+      z: 0.8 - i * 0.1,
+      radius: 0.46 - i * 0.03,
+    }));
+    const flipperTrailingR = Array.from({ length: 6 }, (_, i) => ({
+      x: 1.2 + i * 0.68,
+      y: -1.8,
+      z: 0.8 - i * 0.1,
+      radius: 0.46 - i * 0.03,
+    }));
+
+    ocean.update({
+      time: 1.5,
+      whaleAnchors: { spineStations, flipperTrailingL, flipperTrailingR },
+    });
+
+    expect(uniforms.uWhalePresent.value).toBe(1);
+    for (let i = 0; i < 8; i++) {
+      expect(uniforms.uWhaleSpine.value[i].x).toBeCloseTo(spineStations[i].x, 5);
+      expect(uniforms.uWhaleSpine.value[i].y).toBeCloseTo(spineStations[i].y, 5);
+      expect(uniforms.uWhaleSpine.value[i].z).toBeCloseTo(spineStations[i].z, 5);
+      expect(uniforms.uWhaleSpine.value[i].w).toBeCloseTo(spineStations[i].radius, 5);
+    }
+    // Sampled root -> mid -> tip across left (0..2) and right (3..5) wings
+    expect(uniforms.uWhaleFlippers.value[0].x).toBeCloseTo(flipperTrailingL[0].x, 5);
+    expect(uniforms.uWhaleFlippers.value[2].x).toBeCloseTo(flipperTrailingL[5].x, 5);
+    expect(uniforms.uWhaleFlippers.value[3].x).toBeCloseTo(flipperTrailingR[0].x, 5);
+    expect(uniforms.uWhaleFlippers.value[5].x).toBeCloseTo(flipperTrailingR[5].x, 5);
+
+    // 2. Clean fallback to flipperL / flipperR when trailing arrays are absent
+    ocean.update({
+      time: 1.8,
+      whaleAnchors: {
+        spineStations,
+        flipperL: { x: -4.5, y: -2.1, z: 0.9 },
+        flipperR: { x: 4.5, y: -2.1, z: 0.9 },
+      },
+    });
+    expect(uniforms.uWhalePresent.value).toBe(1);
+    expect(uniforms.uWhaleFlippers.value[2].x).toBeCloseTo(-4.5, 5);
+    expect(uniforms.uWhaleFlippers.value[5].x).toBeCloseTo(4.5, 5);
+
+    // 3. Omitting whaleAnchors resets uWhalePresent cleanly to 0
+    ocean.update({ time: 2.0 });
+    expect(uniforms.uWhalePresent.value).toBe(0);
+  });
+
+  it('computes Beer-Lambert refracted subsurface body silhouette & white-flipper glow during ascent (p=0.19) and recovery (p=0.73) with Fresnel grazing attenuation', () => {
+    const ocean = createOceanSurface();
+    const whale = createWhaleRig();
+    const upNormal = { x: 0, y: 1, z: 0 };
+    const aerialCam = { x: 0, y: 34, z: 0 };
+
+    // 1. Deep start (p = 0.0, y = -21m > 10m below surface): invisible from above
+    whale.update(evaluateBreachState(0.0), 0.0);
+    ocean.update({ time: 0.0, whaleAnchors: whale.getWorldAnchors() });
+    const deepOptics = evaluateSubsurfaceWhaleOptics(
+      { x: 0, y: 0, z: -10 },
+      aerialCam,
+      upNormal,
+      ocean.material.uniforms
+    );
+    expect(deepOptics.bodySilhouette).toBe(0);
+    expect(deepOptics.wingGlow).toBe(0);
+
+    // 2. Rising pre-breach (p = 0.19): submerged body & 4.6m white pectoral wings glow beneath surface
+    whale.update(evaluateBreachState(0.19), 1.7);
+    const ascentAnchors = whale.getWorldAnchors();
+    ocean.update({ time: 1.7, whaleAnchors: ascentAnchors });
+
+    const chestSt = ascentAnchors.spineStations[3];
+    const overBodyAscent = evaluateSubsurfaceWhaleOptics(
+      { x: chestSt.x, y: 0, z: chestSt.z },
+      { x: chestSt.x, y: 30, z: chestSt.z },
+      upNormal,
+      ocean.material.uniforms
+    );
+    const overWingAscent = evaluateSubsurfaceWhaleOptics(
+      { x: ascentAnchors.flipperL.x, y: 0, z: ascentAnchors.flipperL.z },
+      { x: ascentAnchors.flipperL.x, y: 30, z: ascentAnchors.flipperL.z },
+      upNormal,
+      ocean.material.uniforms
+    );
+    expect(overBodyAscent.bodySilhouette).toBeGreaterThan(0.2);
+    expect(overWingAscent.wingGlow).toBeGreaterThan(0.2);
+    expect(overWingAscent.transmittedFraction).toBeGreaterThan(0.95);
+
+    // Grazing camera angle reflects sky via Schlick Fresnel (fresnel > 0.8 -> transmitted < 0.2)
+    const grazingWing = evaluateSubsurfaceWhaleOptics(
+      { x: ascentAnchors.flipperL.x, y: 0, z: ascentAnchors.flipperL.z },
+      { x: ascentAnchors.flipperL.x + 120, y: 0.6, z: ascentAnchors.flipperL.z },
+      upNormal,
+      ocean.material.uniforms
+    );
+    expect(grazingWing.fresnel).toBeGreaterThan(0.8);
+    expect(grazingWing.transmittedFraction).toBeLessThan(0.2);
+
+    // 3. Airborne apex (p = 0.47, y = +9.2m above surface): no underwater silhouette
+    whale.update(evaluateBreachState(0.47), 4.2);
+    ocean.update({ time: 4.2, whaleAnchors: whale.getWorldAnchors() });
+    const apexOptics = evaluateSubsurfaceWhaleOptics(
+      { x: 0.25, y: 0, z: 5.5 },
+      { x: 0.25, y: 34, z: 5.5 },
+      upNormal,
+      ocean.material.uniforms
+    );
+    expect(apexOptics.bodySilhouette).toBe(0);
+    expect(apexOptics.wingGlow).toBe(0);
+
+    // 4. Post-splashdown recovery (p = 0.73): submerged torso & wings visible again before diving > 10m
+    whale.update(evaluateBreachState(0.73), 6.5);
+    const recovAnchors = whale.getWorldAnchors();
+    ocean.update({ time: 6.5, whaleAnchors: recovAnchors });
+    const recovChest = recovAnchors.spineStations[3];
+    const overBodyRecov = evaluateSubsurfaceWhaleOptics(
+      { x: recovChest.x, y: 0, z: recovChest.z },
+      { x: recovChest.x, y: 30, z: recovChest.z },
+      upNormal,
+      ocean.material.uniforms
+    );
+    const overWingRecov = evaluateSubsurfaceWhaleOptics(
+      { x: recovAnchors.flipperL.x, y: 0, z: recovAnchors.flipperL.z },
+      { x: recovAnchors.flipperL.x, y: 30, z: recovAnchors.flipperL.z },
+      upNormal,
+      ocean.material.uniforms
+    );
+    expect(overBodyRecov.bodySilhouette).toBeGreaterThan(0.2);
+    expect(overWingRecov.wingGlow).toBeGreaterThan(0.2);
   });
 });
