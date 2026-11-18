@@ -42,7 +42,7 @@ function organicMottle(x, y, z) {
 /**
  * Evaluates longitudinal Humpback Whale fuselage cross-section envelopes at local z in [-6.76, +7.20].
  */
-function evaluateBodyStation(z) {
+export function evaluateBodyStation(z) {
   // u = 0 at snout (+7.20), u = 1 at peduncle end (-6.76)
   const bodyLen = SNOUT_Z - -6.76; // 13.96m
   const u = clamp((SNOUT_Z - z) / bodyLen, 0, 1);
@@ -344,7 +344,16 @@ function evaluateBodyVertex(z, circ, palette) {
     jawWeight = zJaw * yJaw;
   }
 
-  return { x, y, z, cr, cg, cb, jawWeight };
+  // Signed gape/baleen zone weight (+1 upper baleen fringe, -1 lower inner oral margin) for jawOpen shading
+  let gapeZone = 0;
+  if (z > 2.92 && z < 7.12) {
+    const zGape = smoothstep(2.92, 3.30, z) * smoothstep(7.12, 6.75, z);
+    const dyMouth = y - st.mouthY;
+    const band = Math.exp(-Math.pow(dyMouth / 0.14, 2)) * (1 - Math.abs(cosT) * 0.65);
+    gapeZone = (dyMouth >= 0 ? 1 : -1) * zGape * band;
+  }
+
+  return { x, y, z, cr, cg, cb, jawWeight, gapeZone };
 }
 
 /**
@@ -574,8 +583,25 @@ function appendPectoralFlipper(builder, sideSign, palette) {
     jawWeight: 0,
   };
 
-  const { endPoleIdx } = appendClosedTube(builder, rings, null, tipPole);
-  return endPoleIdx;
+  const { ringOffsets, endPoleIdx } = appendClosedTube(builder, rings, null, tipPole);
+
+  // 6 ordered trailing-edge stations from root to tip along the 4.6m pectoral wing (j = 11 => phi = pi trailing edge)
+  const trailingRingIndices = [3, 9, 15, 21, 27];
+  const trailingEdgeJ = Math.floor(airfoilSegs / 2);
+  const trailingStations = trailingRingIndices.map((rIdx) => {
+    const s = (rIdx / (spanRings - 1)) * 0.985;
+    const fr = evalSpanFrame(s);
+    return {
+      vertexIndex: ringOffsets[rIdx] + trailingEdgeJ,
+      radius: Math.max(0.16, fr.chord * 0.52),
+    };
+  });
+  trailingStations.push({
+    vertexIndex: endPoleIdx,
+    radius: 0.16,
+  });
+
+  return { tipIdx: endPoleIdx, trailingStations };
 }
 
 /**
@@ -700,13 +726,24 @@ function appendTailFlukes(builder, palette) {
     jawWeight: 0,
   };
 
-  const { startPoleIdx: flukeRIdx, endPoleIdx: flukeLIdx } = appendClosedTube(
+  const { ringOffsets, startPoleIdx: flukeRIdx, endPoleIdx: flukeLIdx } = appendClosedTube(
     builder,
     rings,
     rightTipPole,
     leftTipPole
   );
-  return { flukeRIdx, flukeLIdx };
+
+  // 5 stations across the 4.5m tail flukes trailing edge (right tip -> right lobe -> center notch -> left lobe -> left tip)
+  const trailJ = Math.floor(airfoilSegs / 2);
+  const flukeTrailing = [
+    { vertexIndex: flukeRIdx, radius: 0.22 },
+    { vertexIndex: ringOffsets[12] + trailJ, radius: 0.42 },
+    { vertexIndex: ringOffsets[24] + trailJ, radius: 0.48 },
+    { vertexIndex: ringOffsets[36] + trailJ, radius: 0.42 },
+    { vertexIndex: flukeLIdx, radius: 0.22 },
+  ];
+
+  return { flukeRIdx, flukeLIdx, flukeTrailing };
 }
 
 /**
@@ -782,6 +819,7 @@ export function createWhaleGeometry() {
   const partSpanArr = [];
   const partChordArr = [];
   const jawWeightArr = [];
+  const gapeZoneArr = [];
 
   const builder = {
     vertexCount: 0,
@@ -795,6 +833,7 @@ export function createWhaleGeometry() {
       partSpanArr.push(v.partSpan ?? 0);
       partChordArr.push(v.partChord ?? 0);
       jawWeightArr.push(v.jawWeight ?? 0);
+      gapeZoneArr.push(v.gapeZone ?? 0);
       return idx;
     },
     pushTri(a, b, c) {
@@ -811,6 +850,8 @@ export function createWhaleGeometry() {
   let bestChinScore = -Infinity;
   let dorsalIdx = 0;
   let bestDorsalScore = -Infinity;
+  let blowholeIdx = 0;
+  let bestBlowholeDist = Infinity;
 
   for (let i = 0; i < numBodyRings; i++) {
     // Cosine-blended spacingnear snout & peduncle for crisp nose & tail-stock curvature
@@ -835,6 +876,13 @@ export function createWhaleGeometry() {
         if (vt.y > bestDorsalScore) {
           bestDorsalScore = vt.y;
           dorsalIdx = prospectiveIdx;
+        }
+      }
+      if (circTable[j].k === 34) {
+        const bhDist = Math.abs(z - 3.70);
+        if (bhDist < bestBlowholeDist) {
+          bestBlowholeDist = bhDist;
+          blowholeIdx = prospectiveIdx;
         }
       }
 
@@ -886,19 +934,30 @@ export function createWhaleGeometry() {
   const { startPoleIdx: snoutIdx } = appendClosedTube(builder, bodyRings, snoutPole, pedunclePole);
 
   // 2. Left (+X) & Right (-X) Scalloped Pectoral Flippers (749 verts each)
-  const flipperLIdx = appendPectoralFlipper(builder, +1, palette);
-  const flipperRIdx = appendPectoralFlipper(builder, -1, palette);
+  const { tipIdx: flipperLIdx, trailingStations: flipperTrailingL } = appendPectoralFlipper(
+    builder,
+    +1,
+    palette
+  );
+  const { tipIdx: flipperRIdx, trailingStations: flipperTrailingR } = appendPectoralFlipper(
+    builder,
+    -1,
+    palette
+  );
 
   // 3. Unified Butterfly Tail Flukes (982 verts)
-  const { flukeLIdx, flukeRIdx } = appendTailFlukes(builder, palette);
+  const { flukeLIdx, flukeRIdx, flukeTrailing } = appendTailFlukes(builder, palette);
 
   // Build THREE.BufferGeometry
   const geometry = new THREE.BufferGeometry();
   const restPositions = new Float32Array(positions);
   const livePositions = new Float32Array(positions);
+  const restColors = new Float32Array(colors);
+  const liveColors = new Float32Array(colors);
 
   geometry.setAttribute('position', new THREE.BufferAttribute(livePositions, 3));
-  geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(colors), 3));
+  geometry.setAttribute('aRestPos', new THREE.BufferAttribute(restPositions, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(liveColors, 3));
   geometry.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uvs), 2));
   geometry.setIndex(indices);
   geometry.computeVertexNormals();
@@ -926,6 +985,28 @@ export function createWhaleGeometry() {
     return { x: 0, y: 0.04, z: sz, radius: 0.55 };
   });
 
+  // Exact rest coordinates for dorsal blowhole (z = 3.70) and supraorbital cetacean eyes (z = 2.92, y = -0.02)
+  const blowholeVert = evaluateBodyVertex(3.70, circTable[34], palette);
+  const blowholeRest = { x: 0, y: blowholeVert.y, z: 3.70 };
+
+  const eyeSt = evaluateBodyStation(2.92);
+  const eyeTheta = Math.acos(clamp(0.02 / Math.max(0.2, eyeSt.ventralDepth), -1, 1));
+  const eyeCircL = {
+    k: 22,
+    absK: 22,
+    sign: 1,
+    theta: eyeTheta,
+    absTheta: eyeTheta,
+    pleatCos: 1,
+    pleatMask: 0,
+  };
+  const eyeSurfaceL = evaluateBodyVertex(2.92, eyeCircL, palette);
+  const eyeSocketX = Math.max(0.8, eyeSurfaceL.x - 0.02);
+  const eyeRest = {
+    left: { x: eyeSocketX, y: -0.02, z: 2.92 },
+    right: { x: -eyeSocketX, y: -0.02, z: 2.92 },
+  };
+
   const skinMeta = {
     vertexCount: builder.vertexCount,
     part: new Uint8Array(partArr),
@@ -933,6 +1014,7 @@ export function createWhaleGeometry() {
     partSpan: new Float32Array(partSpanArr),
     partChord: new Float32Array(partChordArr),
     jawWeight: new Float32Array(jawWeightArr),
+    gapeZone: new Float32Array(gapeZoneArr),
     pivots: {
       flipperL: SHOULDER_PIVOT_L,
       flipperR: SHOULDER_PIVOT_R,
@@ -942,15 +1024,21 @@ export function createWhaleGeometry() {
       snout: snoutIdx,
       chin: chinIdx,
       dorsal: dorsalIdx,
+      blowhole: blowholeIdx,
       flipperL: flipperLIdx,
       flipperR: flipperRIdx,
       flukeL: flukeLIdx,
       flukeR: flukeRIdx,
     },
+    blowholeRest,
+    eyeRest,
+    flipperTrailingL,
+    flipperTrailingR,
+    flukeTrailing,
     spineStations,
   };
 
-  return { geometry, restPositions, skinMeta, bounds };
+  return { geometry, restPositions, restColors, skinMeta, bounds };
 }
 
 /**
@@ -958,9 +1046,11 @@ export function createWhaleGeometry() {
  * travelling caudal propulsive wave + fluke pitch lag, pectoral fin flare/sweep/flex, and jaw tension.
  */
 export function deformWhaleGeometry(whaleData, animState = {}) {
-  const { geometry, restPositions, skinMeta } = whaleData;
+  const { geometry, restPositions, restColors, skinMeta } = whaleData;
   const posAttr = geometry.getAttribute('position');
   const out = posAttr.array;
+  const colAttr = geometry.getAttribute('color');
+  const colOut = colAttr ? colAttr.array : null;
 
   const spineArch = Number.isFinite(animState.spineArch) ? animState.spineArch : 0;
   const tailBeatPhase = Number.isFinite(animState.tailBeatPhase) ? animState.tailBeatPhase : 0;
@@ -981,6 +1071,8 @@ export function deformWhaleGeometry(whaleData, animState = {}) {
   const partSpan = skinMeta.partSpan;
   const partChord = skinMeta.partChord;
   const jawWeight = skinMeta.jawWeight;
+  const gapeZone = skinMeta.gapeZone;
+  const gapeShadeAmount = clamp(jawOpen * 2.2, 0, 1);
 
   for (let i = 0; i < count; i++) {
     const idx3 = i * 3;
@@ -989,6 +1081,35 @@ export function deformWhaleGeometry(whaleData, animState = {}) {
     let z = restPositions[idx3 + 2];
 
     const pType = part[i];
+
+    // Update baleen keratin fringe & vascular inner-mouth cavity shading along gape when jaw opens
+    if (colOut && restColors && gapeZone) {
+      const gz = gapeZone[i];
+      if (gz !== 0) {
+        if (gapeShadeAmount > 1e-4) {
+          const absGz = Math.abs(gz) * gapeShadeAmount;
+          if (gz > 0) {
+            // Upper rostrum baleen keratin plates (fibrous warm amber-slate striations)
+            const plateComb = 0.5 + 0.5 * Math.sin(z * 78.0);
+            const targetR = lerp(0.18, 0.42, plateComb);
+            const targetG = lerp(0.14, 0.32, plateComb);
+            const targetB = lerp(0.11, 0.23, plateComb);
+            colOut[idx3] = lerp(restColors[idx3], targetR, absGz * 0.85);
+            colOut[idx3 + 1] = lerp(restColors[idx3 + 1], targetG, absGz * 0.85);
+            colOut[idx3 + 2] = lerp(restColors[idx3 + 2], targetB, absGz * 0.85);
+          } else {
+            // Lower gape / oral cavity mucosal shading
+            colOut[idx3] = lerp(restColors[idx3], 0.24, absGz * 0.82);
+            colOut[idx3 + 1] = lerp(restColors[idx3 + 1], 0.13, absGz * 0.82);
+            colOut[idx3 + 2] = lerp(restColors[idx3 + 2], 0.16, absGz * 0.82);
+          }
+        } else {
+          colOut[idx3] = restColors[idx3];
+          colOut[idx3 + 1] = restColors[idx3 + 1];
+          colOut[idx3 + 2] = restColors[idx3 + 2];
+        }
+      }
+    }
 
     // 1. Pectoral flipper articulation in local chest space BEFORE global spine bend
     if (pType === PART_FLIPPER_L || pType === PART_FLIPPER_R) {
@@ -1084,5 +1205,8 @@ export function deformWhaleGeometry(whaleData, animState = {}) {
   }
 
   posAttr.needsUpdate = true;
+  if (colAttr) {
+    colAttr.needsUpdate = true;
+  }
   geometry.computeVertexNormals();
 }

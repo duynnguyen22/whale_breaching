@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   BREACH_CYCLE_DURATION,
+  BREACH_VARIANTS,
   evaluateBreachState,
   createBreachController,
 } from '../src/animation/breachTimeline.js';
+import { createWhaleRig } from '../src/whale/whaleMesh.js';
 
 describe('breachTimeline', () => {
   describe('BREACH_CYCLE_DURATION & phase mapping', () => {
@@ -233,6 +235,158 @@ describe('breachTimeline', () => {
       controller.setAutoLoop(true);
       const afterReenable = controller.update(3.0, 25.0);
       expect(afterReenable.events.some((e) => e.type === 'breakthrough')).toBe(true);
+    });
+  });
+
+  describe('BREACH_VARIANTS, blowIntensity & variant cycling', () => {
+    it('exports all 4 breach variants with C1-compatible start/end seams and distinct choreographies', () => {
+      expect(BREACH_VARIANTS).toEqual([
+        'classic',
+        'chin-slam',
+        'barrel-port',
+        'tail-lob',
+      ]);
+
+      const eps = 1e-4;
+      for (const variant of BREACH_VARIANTS) {
+        const s0 = evaluateBreachState(0.0, { variant });
+        const beforeWrap = evaluateBreachState(0.9999, { variant });
+        const afterWrap = evaluateBreachState(0.0001, { variant });
+
+        expect(s0.variant).toBe(variant);
+        expect(s0.position.x).toBeCloseTo(0, 3);
+        expect(s0.position.y).toBeCloseTo(-21, 2);
+        expect(s0.position.z).toBeCloseTo(-10, 2);
+        expect(s0.rotation.pitch).toBeCloseTo(1.05, 2);
+        expect(s0.rotation.yaw).toBeCloseTo(0, 3);
+        expect(s0.blowIntensity).toBe(0);
+        expect(s0.wetness).toBe(1.0);
+
+        // Seamless C1 wrap continuity across 1 -> 0
+        expect(beforeWrap.position.x).toBeCloseTo(afterWrap.position.x, 1);
+        expect(beforeWrap.position.y).toBeCloseTo(afterWrap.position.y, 1);
+        expect(beforeWrap.position.z).toBeCloseTo(afterWrap.position.z, 1);
+        expect(beforeWrap.velocity.x).toBeCloseTo(afterWrap.velocity.x, 1);
+        expect(beforeWrap.velocity.y).toBeCloseTo(afterWrap.velocity.y, 1);
+        expect(beforeWrap.velocity.z).toBeCloseTo(afterWrap.velocity.z, 1);
+        expect(Math.cos(beforeWrap.rotation.roll)).toBeCloseTo(
+          Math.cos(afterWrap.rotation.roll),
+          4
+        );
+        expect(Math.sin(beforeWrap.rotation.roll)).toBeCloseTo(
+          Math.sin(afterWrap.rotation.roll),
+          3
+        );
+
+        // C1 analytical velocity parity across interior points
+        for (const p of [0.1, 0.3, 0.5, 0.7, 0.88]) {
+          const prev = evaluateBreachState(p - eps, { variant });
+          const curr = evaluateBreachState(p, { variant });
+          const next = evaluateBreachState(p + eps, { variant });
+          const dt = 2 * eps * BREACH_CYCLE_DURATION;
+          expect(curr.velocity.x).toBeCloseTo((next.position.x - prev.position.x) / dt, 2);
+          expect(curr.velocity.y).toBeCloseTo((next.position.y - prev.position.y) / dt, 2);
+          expect(curr.velocity.z).toBeCloseTo((next.position.z - prev.position.z) / dt, 2);
+          expect(curr.blowIntensity).toBeGreaterThanOrEqual(0);
+          expect(curr.blowIntensity).toBeLessThanOrEqual(1);
+        }
+      }
+
+      // Distinct variant choreography checks
+      const chinApex = evaluateBreachState(0.46, { variant: 'chin-slam' });
+      expect(Math.abs(chinApex.rotation.roll)).toBeLessThan(0.35);
+      expect(chinApex.jawOpen).toBeGreaterThan(0.3);
+      expect(chinApex.finSpread).toBeGreaterThan(0.95);
+      expect(evaluateBreachState(0.60, { variant: 'chin-slam' }).spineArch).toBeLessThan(-0.2);
+
+      const portApex = evaluateBreachState(0.47, { variant: 'barrel-port' });
+      expect(portApex.position.x).toBeLessThan(-1.2);
+      expect(portApex.rotation.roll).toBeLessThan(-2.5);
+      expect(portApex.rotation.yaw).toBeLessThan(-0.15);
+
+      const lobBlow = evaluateBreachState(0.30, { variant: 'tail-lob' });
+      expect(lobBlow.blowIntensity).toBeCloseTo(1.0, 2);
+      const lobHoist = evaluateBreachState(0.52, { variant: 'tail-lob' });
+      expect(lobHoist.rotation.pitch).toBeLessThan(-0.85);
+    });
+
+    it('pulses blowIntensity cleanly while the dorsal blowhole is above water in all variants', () => {
+      const rig = createWhaleRig();
+
+      for (const variant of BREACH_VARIANTS) {
+        let peakBlow = 0;
+        let blowholeYAtPeak = -Infinity;
+        for (let p = 0; p < 1.0; p += 0.01) {
+          const st = evaluateBreachState(p, { variant });
+          if (st.blowIntensity > peakBlow) {
+            peakBlow = st.blowIntensity;
+            rig.update(st, p * BREACH_CYCLE_DURATION);
+            blowholeYAtPeak = rig.getWorldAnchors().blowhole.y;
+          }
+        }
+        expect(peakBlow).toBeGreaterThan(0.7);
+        expect(blowholeYAtPeak).toBeGreaterThan(1.5);
+      }
+    });
+
+    it('supports controller.setVariant/getVariant, auto-cycles through all 4 variants across loops, and enriches events', () => {
+      const controller = createBreachController({ cycleDuration: 9.0, autoLoop: true });
+      expect(controller.getVariant()).toBe('auto');
+      expect(controller.getState().variant).toBe('classic');
+
+      const seenCycleVariants = [];
+      const allEvents = [];
+      const dt = 0.1;
+      let t = 0;
+
+      // Advance 5 full 9.0s cycles (450 steps of 0.1s)
+      for (let cycle = 0; cycle < 5; cycle += 1) {
+        // Sample mid-cycle state at step 40 (4.0s into cycle)
+        for (let step = 0; step < 90; step += 1) {
+          t = Number((t + dt).toFixed(4));
+          const { state, events } = controller.update(dt, t);
+          if (step === 40) {
+            seenCycleVariants.push(state.variant);
+          }
+          allEvents.push(...events);
+        }
+      }
+
+      expect(seenCycleVariants).toEqual([
+        'classic',
+        'chin-slam',
+        'barrel-port',
+        'tail-lob',
+        'classic',
+      ]);
+
+      expect(allEvents).toHaveLength(10);
+      for (const ev of allEvents) {
+        expect(BREACH_VARIANTS).toContain(ev.variant);
+        expect(Number.isFinite(ev.heading)).toBe(true);
+        expect(Number.isFinite(ev.roll)).toBe(true);
+        expect(Number.isFinite(ev.x)).toBe(true);
+        expect(Number.isFinite(ev.z)).toBe(true);
+      }
+
+      // Pinning a specific variant locks it across loops
+      expect(controller.setVariant('barrel-port')).toBe('barrel-port');
+      expect(controller.getVariant()).toBe('barrel-port');
+      expect(controller.getState().variant).toBe('barrel-port');
+
+      for (let i = 0; i < 120; i += 1) {
+        t = Number((t + dt).toFixed(4));
+        controller.update(dt, t);
+      }
+      expect(controller.getState().variant).toBe('barrel-port');
+
+      // Invalid variant name is safely ignored
+      controller.setVariant('unknown-style');
+      expect(controller.getVariant()).toBe('barrel-port');
+
+      // Switching back to auto resumes auto mode cleanly
+      expect(controller.setVariant('auto')).toBe('auto');
+      expect(controller.getVariant()).toBe('auto');
     });
   });
 });

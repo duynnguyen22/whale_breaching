@@ -515,4 +515,216 @@ describe('Whale Rig, Wet Skin Material & Right-Handed Kinematics (whaleMesh.js)'
     expect(poseB.flipperL.x).toBeGreaterThan(poseA.flipperL.x + 0.35);
     expect(Math.abs(poseA.spineStations[7].y - poseB.spineStations[7].y)).toBeGreaterThan(0.8);
   });
+
+  it('adds glossy dark cetacean eyes at supraorbital sockets (z ~ 2.92, y ~ -0.02, x ~ +-halfWidth) and baleen/inner-mouth shading when jawOpen > 0', () => {
+    const rig = createWhaleRig();
+
+    const eyeL = rig.group.getObjectByName('WhaleEyeL');
+    const eyeR = rig.group.getObjectByName('WhaleEyeR');
+    expect(eyeL).toBeInstanceOf(THREE.Mesh);
+    expect(eyeR).toBeInstanceOf(THREE.Mesh);
+    expect(rig.eyes.left).toBe(eyeL);
+    expect(rig.eyes.right).toBe(eyeR);
+
+    // Glossy dark cetacean eye material
+    expect(eyeL.material).toBeInstanceOf(THREE.MeshPhysicalMaterial);
+    expect(eyeL.material.clearcoat).toBeGreaterThanOrEqual(0.95);
+    expect(eyeL.material.roughness).toBeLessThan(0.08);
+    const eyeLum =
+      0.2126 * eyeL.material.color.r +
+      0.7152 * eyeL.material.color.g +
+      0.0722 * eyeL.material.color.b;
+    expect(eyeLum).toBeLessThan(0.03);
+
+    // Rest socket positions (z ~ 2.92, y ~ -0.02, symmetric +-halfWidth)
+    expect(eyeL.position.z).toBeCloseTo(2.92, 2);
+    expect(eyeR.position.z).toBeCloseTo(2.92, 2);
+    expect(eyeL.position.y).toBeCloseTo(-0.02, 2);
+    expect(eyeR.position.y).toBeCloseTo(-0.02, 2);
+    expect(eyeL.position.x).toBeGreaterThan(1.25);
+    expect(eyeL.position.x).toBeLessThan(1.60);
+    expect(eyeR.position.x).toBeCloseTo(-eyeL.position.x, 5);
+
+    // Eyes deform coherently with head/spine arch
+    const restEyeY = eyeL.position.y;
+    rig.update(
+      {
+        position: { x: 0, y: 0, z: 0 },
+        rotation: { pitch: 0, yaw: 0, roll: 0 },
+        spineArch: 0.9,
+        tailBeatAmplitude: 0,
+        jawOpen: 0,
+      },
+      0.5
+    );
+    expect(eyeL.position.y).toBeGreaterThan(restEyeY + 0.06);
+    expect(eyeR.position.y).toBeCloseTo(eyeL.position.y, 5);
+
+    // Inner baleen cavity mesh & gape vertex colors respond to jawOpen > 0 and reset cleanly at jawOpen = 0
+    expect(rig.baleenMesh.visible).toBe(false);
+    const colAttr = rig.whaleData.geometry.getAttribute('color');
+    const restColorsCopy = new Float32Array(colAttr.array);
+
+    rig.update(
+      {
+        position: { x: 0, y: 0, z: 0 },
+        rotation: { pitch: 0, yaw: 0, roll: 0 },
+        spineArch: 0,
+        tailBeatAmplitude: 0,
+        jawOpen: 0.45,
+      },
+      1.0
+    );
+    expect(rig.baleenMesh.visible).toBe(true);
+    let changedGapeVertices = 0;
+    for (let i = 0; i < colAttr.count; i++) {
+      const diff =
+        Math.abs(colAttr.array[i * 3] - restColorsCopy[i * 3]) +
+        Math.abs(colAttr.array[i * 3 + 1] - restColorsCopy[i * 3 + 1]) +
+        Math.abs(colAttr.array[i * 3 + 2] - restColorsCopy[i * 3 + 2]);
+      if (diff > 0.02) changedGapeVertices++;
+    }
+    expect(changedGapeVertices).toBeGreaterThan(30);
+
+    // Resetting jawOpen = 0 hides baleen cavity and restores exact restColors
+    rig.update(
+      {
+        position: { x: 0, y: 0, z: 0 },
+        rotation: { pitch: 0, yaw: 0, roll: 0 },
+        spineArch: 0,
+        tailBeatAmplitude: 0,
+        jawOpen: 0,
+      },
+      1.5
+    );
+    expect(rig.baleenMesh.visible).toBe(false);
+    for (let i = 0; i < restColorsCopy.length; i++) {
+      expect(colAttr.array[i]).toBeCloseTo(restColorsCopy[i], 5);
+    }
+  });
+
+  it('enhances MeshPhysicalMaterial via onBeforeCompile with dermal pores, rake scars, barnacles, airborne runoff streaks, and underwater caustics', () => {
+    const rig = createWhaleRig();
+    const mat = rig.mesh.material;
+    expect(typeof mat.onBeforeCompile).toBe('function');
+
+    // Compile against Three.js ShaderLib.physical
+    const mockShader = {
+      uniforms: THREE.UniformsUtils.clone(THREE.ShaderLib.physical.uniforms),
+      vertexShader: THREE.ShaderLib.physical.vertexShader,
+      fragmentShader: THREE.ShaderLib.physical.fragmentShader,
+    };
+    mat.onBeforeCompile(mockShader);
+
+    // Verify uniforms are wired by reference
+    expect(mockShader.uniforms.uTime).toBe(rig.shaderUniforms.uTime);
+    expect(mockShader.uniforms.uWetness).toBe(rig.shaderUniforms.uWetness);
+    expect(mockShader.uniforms.uWaterLevel).toBe(rig.shaderUniforms.uWaterLevel);
+    expect(mockShader.uniforms.uSunDirection).toBe(rig.shaderUniforms.uSunDirection);
+    expect(mockShader.uniforms.uJawOpen).toBe(rig.shaderUniforms.uJawOpen);
+
+    // Verify vertex & fragment GLSL injections
+    expect(mockShader.vertexShader).toContain('attribute vec3 aRestPos;');
+    expect(mockShader.vertexShader).toContain('vWorldPos =');
+    expect(mockShader.fragmentShader).toContain('whaleDermalPores');
+    expect(mockShader.fragmentShader).toContain('whaleRakeScars');
+    expect(mockShader.fragmentShader).toContain('whaleBarnacles');
+    expect(mockShader.fragmentShader).toContain('whaleRunoffStreaks');
+    expect(mockShader.fragmentShader).toContain('whaleCaustics');
+    expect(mockShader.fragmentShader).toContain('vWorldPos.y < uWaterLevel');
+
+    // Verify update() safely defaults when envInfo is omitted
+    rig.update({ wetness: 0.78, jawOpen: 0.25 }, 3.25);
+    expect(mockShader.uniforms.uTime.value).toBeCloseTo(3.25, 5);
+    expect(mockShader.uniforms.uWetness.value).toBeCloseTo(0.78, 5);
+    expect(mockShader.uniforms.uWaterLevel.value).toBeCloseTo(0.0, 5);
+    expect(mockShader.uniforms.uJawOpen.value).toBeCloseTo(0.25, 5);
+    expect(mockShader.uniforms.uSunDirection.value.length()).toBeCloseTo(1.0, 4);
+
+    // Verify update() applies custom envInfo { waterLevel, sunDirection }
+    rig.update(
+      { wetness: 1.0, jawOpen: 0 },
+      5.5,
+      { waterLevel: 1.42, sunDirection: new THREE.Vector3(2.0, 4.0, -4.0) }
+    );
+    expect(mockShader.uniforms.uTime.value).toBeCloseTo(5.5, 5);
+    expect(mockShader.uniforms.uWaterLevel.value).toBeCloseTo(1.42, 5);
+    expect(mockShader.uniforms.uSunDirection.value.length()).toBeCloseTo(1.0, 5);
+    expect(mockShader.uniforms.uSunDirection.value.y).toBeCloseTo(4.0 / 6.0, 4);
+  });
+
+  it('extends getWorldAnchors() with blowhole, upDir, flipperTrailingL[6], flipperTrailingR[6], and flukeTrailing[5]', () => {
+    const rig = createWhaleRig();
+    rig.update(
+      {
+        position: { x: 0, y: 0, z: 0 },
+        rotation: { pitch: 0, yaw: 0, roll: 0 },
+        spineArch: 0,
+        tailBeatAmplitude: 0,
+        finSpread: 0.5,
+      },
+      0
+    );
+
+    const anchors = rig.getWorldAnchors();
+
+    // Blowhole & head dorsal upDir in neutral rest pose
+    expect(anchors.blowhole).toBeInstanceOf(THREE.Vector3);
+    expect(anchors.blowhole.x).toBeCloseTo(0, 3);
+    expect(anchors.blowhole.z).toBeCloseTo(3.70, 2);
+    expect(anchors.blowhole.y).toBeGreaterThan(0.6);
+
+    expect(anchors.upDir).toBeInstanceOf(THREE.Vector3);
+    expect(anchors.upDir.length()).toBeCloseTo(1.0, 5);
+    expect(anchors.upDir.y).toBeCloseTo(1.0, 4);
+
+    // 6 stations along each 4.6m pectoral wing from root to tip
+    expect(anchors.flipperTrailingL).toHaveLength(6);
+    expect(anchors.flipperTrailingR).toHaveLength(6);
+    for (let i = 0; i < 6; i++) {
+      const stL = anchors.flipperTrailingL[i];
+      const stR = anchors.flipperTrailingR[i];
+      expect(Number.isFinite(stL.x) && Number.isFinite(stL.y) && Number.isFinite(stL.z)).toBe(true);
+      expect(Number.isFinite(stR.x) && Number.isFinite(stR.y) && Number.isFinite(stR.z)).toBe(true);
+      expect(stL.radius).toBeGreaterThan(0.1);
+      expect(stR.radius).toBeCloseTo(stL.radius, 5);
+      expect(stR.x).toBeCloseTo(-stL.x, 4);
+      if (i > 0) {
+        expect(stL.x).toBeGreaterThan(anchors.flipperTrailingL[i - 1].x);
+        expect(stR.x).toBeLessThan(anchors.flipperTrailingR[i - 1].x);
+      }
+    }
+    expect(anchors.flipperTrailingL[0].x).toBeGreaterThan(0.95);
+    expect(anchors.flipperTrailingL[0].x).toBeLessThan(1.4);
+    expect(anchors.flipperTrailingL[5].x).toBeCloseTo(4.75, 2);
+
+    // 5 stations across the 4.5m tail flukes (-2.25m to +2.25m)
+    expect(anchors.flukeTrailing).toHaveLength(5);
+    for (let i = 0; i < 5; i++) {
+      const stF = anchors.flukeTrailing[i];
+      expect(Number.isFinite(stF.x) && Number.isFinite(stF.y) && Number.isFinite(stF.z)).toBe(true);
+      expect(stF.radius).toBeGreaterThan(0.15);
+      if (i > 0) {
+        expect(stF.x).toBeGreaterThan(anchors.flukeTrailing[i - 1].x);
+      }
+    }
+    expect(anchors.flukeTrailing[0].x).toBeCloseTo(-2.25, 2);
+    expect(anchors.flukeTrailing[2].x).toBeCloseTo(0.0, 2);
+    expect(anchors.flukeTrailing[4].x).toBeCloseTo(2.25, 2);
+
+    // Verify upDir tilts accurately when whale rolls 90 degrees
+    rig.update(
+      {
+        position: { x: 0, y: 4, z: 0 },
+        rotation: { pitch: 0, yaw: 0, roll: Math.PI * 0.5 },
+        spineArch: 0,
+        tailBeatAmplitude: 0,
+      },
+      1.0
+    );
+    const rolledAnchors = rig.getWorldAnchors();
+    expect(rolledAnchors.upDir.length()).toBeCloseTo(1.0, 5);
+    expect(Math.abs(rolledAnchors.upDir.y)).toBeLessThan(0.05);
+    expect(Math.abs(rolledAnchors.upDir.x)).toBeGreaterThan(0.95);
+  });
 });
