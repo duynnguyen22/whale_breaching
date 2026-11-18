@@ -6,20 +6,38 @@ const PHASE_LABELS = {
   recovery: 'Subsurface Glide',
 };
 
-const SPEED_OPTIONS = [
+export const SPEED_OPTIONS = [
   { value: 0.25, label: '0.25× Slow-Mo' },
   { value: 0.5, label: '0.5×' },
   { value: 1, label: '1×' },
 ];
 
-const CAMERA_OPTIONS = [
+export const CAMERA_OPTIONS = [
   { value: 'low-angle', label: 'Low-Angle', keyHint: '1' },
   { value: 'close-breach', label: 'Close Breach', keyHint: '2' },
   { value: 'underwater', label: 'Underwater', keyHint: '3' },
   { value: 'orbit', label: 'Free Orbit', keyHint: '4' },
+  { value: 'split', label: 'Split Waterline', keyHint: '5' },
+  { value: 'aerial', label: 'Aerial Drone', keyHint: '6' },
 ];
 
-const MOOD_OPTIONS = [
+export const VARIANT_OPTIONS = [
+  { value: 'auto', label: 'Auto' },
+  { value: 'classic', label: 'Classic' },
+  { value: 'chin-slam', label: 'Chin Slam' },
+  { value: 'barrel-port', label: 'Barrel Spin' },
+  { value: 'tail-lob', label: 'Tail Lob' },
+];
+
+const VARIANT_LABELS = {
+  auto: 'Auto',
+  classic: 'Classic',
+  'chin-slam': 'Chin Slam',
+  'barrel-port': 'Barrel Spin',
+  'tail-lob': 'Tail Lob',
+};
+
+export const MOOD_OPTIONS = [
   { value: 'golden', label: 'Golden Hour' },
   { value: 'noon', label: 'High Noon' },
   { value: 'twilight', label: 'Twilight' },
@@ -27,6 +45,14 @@ const MOOD_OPTIONS = [
 
 export function getPhaseLabel(phaseName) {
   return PHASE_LABELS[phaseName] ?? 'Deep Ascent';
+}
+
+export function getVariantLabel(variant, activeVariant = null) {
+  const modeLabel = VARIANT_LABELS[variant] ?? 'Classic';
+  if (variant === 'auto' && activeVariant && VARIANT_LABELS[activeVariant]) {
+    return `Auto · ${VARIANT_LABELS[activeVariant]}`;
+  }
+  return modeLabel;
 }
 
 export function createHud({
@@ -37,12 +63,17 @@ export function createHud({
   onSelectSpeed = () => {},
   onSelectCamera = () => {},
   onSelectMood = () => {},
+  onSelectVariant = () => {},
+  onToggleSound = () => {},
 }) {
   const uiState = {
     paused: Boolean(initialState.paused ?? false),
     speed: Number(initialState.speed ?? 1),
     camera: initialState.camera ?? 'low-angle',
     mood: initialState.mood ?? 'golden',
+    variant: initialState.variant ?? 'auto',
+    activeVariant: initialState.activeVariant ?? 'classic',
+    soundEnabled: Boolean(initialState.soundEnabled ?? false),
     phaseName: initialState.phaseName ?? 'ascent',
     progress: Number(initialState.progress ?? 0),
     elevation: Number(initialState.elevation ?? 0),
@@ -63,6 +94,10 @@ export function createHud({
         <div class="hud-progress-track" aria-hidden="true">
           <div class="hud-progress-fill" data-role="progress-fill"></div>
         </div>
+        <div class="hud-meta-row">
+          <span class="hud-meta-tag">Breach Style</span>
+          <span class="hud-variant-badge" data-role="variant-readout">Auto · Classic</span>
+        </div>
       </div>
     </header>
 
@@ -81,6 +116,11 @@ export function createHud({
             <span data-role="pause-label">Pause</span>
             <kbd class="hud-kbd">P</kbd>
           </button>
+          <button type="button" class="hud-btn hud-btn-transport hud-btn-sound" data-action="toggle-sound" aria-pressed="false">
+            <span class="hud-sound-dot" data-role="sound-dot" aria-hidden="true"></span>
+            <span data-role="sound-label">Sound Off</span>
+            <kbd class="hud-kbd">M</kbd>
+          </button>
         </div>
 
         <span class="hud-divider" aria-hidden="true"></span>
@@ -95,6 +135,24 @@ export function createHud({
                   class="hud-btn"
                   data-speed="${opt.value}"
                   aria-pressed="${opt.value === uiState.speed}"
+                >${opt.label}</button>
+              `,
+            ).join('')}
+          </div>
+        </div>
+
+        <span class="hud-divider" aria-hidden="true"></span>
+
+        <div class="hud-group" role="group" aria-label="Breach Style">
+          <span class="hud-group-label">Style <kbd class="hud-kbd">V</kbd></span>
+          <div class="hud-segmented">
+            ${VARIANT_OPTIONS.map(
+              (opt) => `
+                <button
+                  type="button"
+                  class="hud-btn"
+                  data-variant="${opt.value}"
+                  aria-pressed="${opt.value === uiState.variant}"
                 >${opt.label}</button>
               `,
             ).join('')}
@@ -147,11 +205,15 @@ export function createHud({
   const phaseLabelEl = container.querySelector('[data-role="phase-label"]');
   const altitudeEl = container.querySelector('[data-role="altitude-readout"]');
   const progressFillEl = container.querySelector('[data-role="progress-fill"]');
+  const variantReadoutEl = container.querySelector('[data-role="variant-readout"]');
   const orbitHintEl = container.querySelector('[data-role="orbit-hint"]');
   const breachBtn = container.querySelector('[data-action="breach"]');
   const pauseBtn = container.querySelector('[data-action="toggle-pause"]');
   const pauseLabelEl = container.querySelector('[data-role="pause-label"]');
+  const soundBtn = container.querySelector('[data-action="toggle-sound"]');
+  const soundLabelEl = container.querySelector('[data-role="sound-label"]');
   const speedButtons = Array.from(container.querySelectorAll('[data-speed]'));
+  const variantButtons = Array.from(container.querySelectorAll('[data-variant]'));
   const cameraButtons = Array.from(container.querySelectorAll('[data-camera]'));
   const moodButtons = Array.from(container.querySelectorAll('[data-mood]'));
 
@@ -160,8 +222,18 @@ export function createHud({
     pauseBtn.classList.toggle('is-active', uiState.paused);
     pauseLabelEl.textContent = uiState.paused ? 'Play' : 'Pause';
 
+    soundBtn.setAttribute('aria-pressed', String(uiState.soundEnabled));
+    soundBtn.classList.toggle('is-active', uiState.soundEnabled);
+    soundLabelEl.textContent = uiState.soundEnabled ? 'Sound On' : 'Sound Off';
+
     for (const btn of speedButtons) {
       const active = Math.abs(Number(btn.dataset.speed) - uiState.speed) < 1e-4;
+      btn.classList.toggle('is-active', active);
+      btn.setAttribute('aria-pressed', String(active));
+    }
+
+    for (const btn of variantButtons) {
+      const active = btn.dataset.variant === uiState.variant;
       btn.classList.toggle('is-active', active);
       btn.setAttribute('aria-pressed', String(active));
     }
@@ -178,7 +250,25 @@ export function createHud({
       btn.setAttribute('aria-pressed', String(active));
     }
 
+    variantReadoutEl.textContent = getVariantLabel(
+      uiState.variant,
+      uiState.activeVariant,
+    );
     orbitHintEl.classList.toggle('is-visible', uiState.camera === 'orbit');
+  }
+
+  function cycleNextVariant() {
+    const currentIdx = VARIANT_OPTIONS.findIndex(
+      (opt) => opt.value === uiState.variant,
+    );
+    const nextIdx = (currentIdx + 1) % VARIANT_OPTIONS.length;
+    const nextVariant = VARIANT_OPTIONS[nextIdx].value;
+    uiState.variant = nextVariant;
+    if (nextVariant !== 'auto') {
+      uiState.activeVariant = nextVariant;
+    }
+    syncControls();
+    onSelectVariant(nextVariant);
   }
 
   function handleClick(event) {
@@ -195,9 +285,25 @@ export function createHud({
       return;
     }
 
+    if (btn === soundBtn) {
+      onToggleSound();
+      return;
+    }
+
     if (btn.dataset.speed) {
       const nextSpeed = Number(btn.dataset.speed);
       onSelectSpeed(nextSpeed);
+      return;
+    }
+
+    if (btn.dataset.variant) {
+      const nextVariant = btn.dataset.variant;
+      uiState.variant = nextVariant;
+      if (nextVariant !== 'auto') {
+        uiState.activeVariant = nextVariant;
+      }
+      syncControls();
+      onSelectVariant(nextVariant);
       return;
     }
 
@@ -214,7 +320,14 @@ export function createHud({
   function handleKeyDown(event) {
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     const tag = event.target?.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (
+      tag === 'INPUT' ||
+      tag === 'TEXTAREA' ||
+      tag === 'SELECT' ||
+      event.target?.isContentEditable
+    ) {
+      return;
+    }
 
     if (event.code === 'Space') {
       event.preventDefault();
@@ -222,6 +335,12 @@ export function createHud({
     } else if (event.code === 'KeyP') {
       event.preventDefault();
       onTogglePause();
+    } else if (event.code === 'KeyM') {
+      event.preventDefault();
+      onToggleSound();
+    } else if (event.code === 'KeyV') {
+      event.preventDefault();
+      cycleNextVariant();
     } else if (event.code === 'Digit1') {
       onSelectCamera('low-angle');
     } else if (event.code === 'Digit2') {
@@ -230,6 +349,10 @@ export function createHud({
       onSelectCamera('underwater');
     } else if (event.code === 'Digit4') {
       onSelectCamera('orbit');
+    } else if (event.code === 'Digit5') {
+      onSelectCamera('split');
+    } else if (event.code === 'Digit6') {
+      onSelectCamera('aerial');
     }
   }
 
@@ -244,17 +367,26 @@ export function createHud({
     speed = uiState.speed,
     camera = uiState.camera,
     mood = uiState.mood,
+    variant = uiState.variant,
+    activeVariant = uiState.activeVariant,
+    soundEnabled = uiState.soundEnabled,
   } = {}) {
     const controlsChanged =
       paused !== uiState.paused ||
       speed !== uiState.speed ||
       camera !== uiState.camera ||
-      mood !== uiState.mood;
+      mood !== uiState.mood ||
+      variant !== uiState.variant ||
+      activeVariant !== uiState.activeVariant ||
+      soundEnabled !== uiState.soundEnabled;
 
-    uiState.paused = paused;
+    uiState.paused = Boolean(paused);
     uiState.speed = speed;
     uiState.camera = camera;
     uiState.mood = mood;
+    uiState.variant = variant;
+    uiState.activeVariant = activeVariant;
+    uiState.soundEnabled = Boolean(soundEnabled);
 
     if (controlsChanged) {
       syncControls();
@@ -286,6 +418,7 @@ export function createHud({
   return {
     update,
     getPhaseLabel,
+    getVariantLabel,
     dispose,
   };
 }

@@ -3,15 +3,17 @@ import { evaluateOceanHeight } from './math/oceanMath.js';
 import {
   createBreachController,
   BREACH_CYCLE_DURATION,
+  BREACH_VARIANTS,
 } from './animation/breachTimeline.js';
 import { createWhaleRig } from './whale/whaleMesh.js';
 import { createOceanSurface } from './ocean/oceanSurface.js';
 import { createSplashSystem } from './effects/splashSystem.js';
 import { createEnvironment } from './scene/environment.js';
 import { createCameraRig } from './scene/cameraRig.js';
+import { createSoundscape } from './audio/soundscape.js';
 import { createHud } from './ui/hud.js';
 
-function initWhaleScene() {
+export function initWhaleScene({ createRenderer, createAudioContext } = {}) {
   const canvas = document.getElementById('scene-canvas');
   const hudContainer = document.getElementById('hud-root');
 
@@ -23,13 +25,19 @@ function initWhaleScene() {
 
   const initialViewport = getViewportSize();
 
-  const renderer = new THREE.WebGLRenderer({
-    canvas,
-    antialias: true,
-    powerPreference: 'high-performance',
-  });
-  renderer.setPixelRatio(initialViewport.pixelRatio);
-  renderer.setSize(initialViewport.width, initialViewport.height, false);
+  const renderer =
+    typeof createRenderer === 'function'
+      ? createRenderer({ canvas })
+      : new THREE.WebGLRenderer({
+          canvas,
+          antialias: true,
+          powerPreference: 'high-performance',
+        });
+
+  if (renderer) {
+    renderer.setPixelRatio(initialViewport.pixelRatio);
+    renderer.setSize(initialViewport.width, initialViewport.height, false);
+  }
 
   const scene = new THREE.Scene();
 
@@ -41,7 +49,7 @@ function initWhaleScene() {
 
   const environment = createEnvironment({
     scene,
-    renderer,
+    renderer: renderer?.capabilities ? renderer : null,
     camera: cameraRig.camera,
     initialMood: 'golden',
     width: initialViewport.width,
@@ -51,6 +59,7 @@ function initWhaleScene() {
   const controller = createBreachController({
     cycleDuration: BREACH_CYCLE_DURATION,
     autoLoop: true,
+    variant: 'auto',
   });
 
   const whaleRig = createWhaleRig();
@@ -62,9 +71,22 @@ function initWhaleScene() {
   const splashSystem = createSplashSystem();
   scene.add(splashSystem.group);
 
+  const soundscape = createSoundscape(
+    createAudioContext ? { createAudioContext } : {},
+  );
+
   let simTime = 0;
   let frameCount = 0;
   let currentBreachState = controller.getState();
+  let lastCamStatus = {
+    preset: cameraRig.getPreset(),
+    isSubmerged: false,
+    waterlineFraction: 0,
+    waterHeightAtCamera: 0,
+    shakeIntensity: 0,
+    lensWetness: 0,
+    fov: cameraRig.camera.fov,
+  };
 
   const getWaterHeight = (x, z, queryTime = simTime) =>
     evaluateOceanHeight(x, z, queryTime, {
@@ -72,37 +94,88 @@ function initWhaleScene() {
       ripples: oceanSurface.ripples,
     });
 
+  let hud = null;
+
+  function syncHud() {
+    if (!hud) return;
+    hud.update({
+      phaseName: currentBreachState.phaseName,
+      progress: currentBreachState.progress,
+      elevation: currentBreachState.position.y,
+      paused: controller.isPaused(),
+      speed: controller.getTimeScale(),
+      camera: cameraRig.getPreset(),
+      mood: environment.getMood(),
+      variant: controller.getVariant(),
+      activeVariant: currentBreachState.variant,
+      soundEnabled: soundscape.isEnabled(),
+    });
+  }
+
   function triggerBreach() {
     currentBreachState = controller.triggerBreach();
+    syncHud();
     return currentBreachState;
   }
 
   function togglePause() {
     controller.setPaused(!controller.isPaused());
+    syncHud();
     return controller.isPaused();
   }
 
   function setSpeed(scale) {
     controller.setTimeScale(scale);
+    syncHud();
     return controller.getTimeScale();
   }
 
   function setCameraPreset(presetName, options) {
     cameraRig.setPreset(presetName, options);
+    syncHud();
     return cameraRig.getPreset();
   }
 
   function setMood(moodName) {
-    return environment.setMood(moodName);
+    const res = environment.setMood(moodName);
+    syncHud();
+    return res;
   }
 
-  const hud = createHud({
+  function setVariant(mode) {
+    const res = controller.setVariant(mode);
+    currentBreachState = controller.getState();
+    syncHud();
+    return res;
+  }
+
+  function toggleSound() {
+    const enabled = soundscape.toggle();
+    syncHud();
+    return enabled;
+  }
+
+  function triggerBlow(intensity = 1.0) {
+    const anchors = whaleRig.getWorldAnchors();
+    splashSystem.triggerSpout({
+      blowhole: anchors.blowhole,
+      upDir: anchors.upDir,
+      intensity,
+      velocity: currentBreachState?.velocity,
+    });
+    return soundscape.triggerBlow({ intensity });
+  }
+
+  hud = createHud({
     container: hudContainer,
     initialState: {
       paused: controller.isPaused(),
       speed: controller.getTimeScale(),
       camera: cameraRig.getPreset(),
       mood: environment.getMood(),
+      variant: controller.getVariant(),
+      activeVariant: currentBreachState.variant,
+      soundEnabled: soundscape.isEnabled(),
       phaseName: currentBreachState.phaseName,
       progress: currentBreachState.progress,
       elevation: currentBreachState.position.y,
@@ -122,39 +195,119 @@ function initWhaleScene() {
     onSelectMood: (mood) => {
       setMood(mood);
     },
+    onSelectVariant: (variant) => {
+      setVariant(variant);
+    },
+    onToggleSound: () => {
+      toggleSound();
+    },
   });
 
-  function dispatchEvents(events) {
+  function maybeTriggerLensSplash(ev, baseAmount) {
+    const preset = cameraRig.getPreset();
+    if (preset === 'underwater' || preset === 'aerial') return;
+
+    const camPos = cameraRig.camera.position;
+    const waterAtCam = getWaterHeight(camPos.x, camPos.z, simTime);
+    const isAboveOrSplit = preset === 'split' || camPos.y >= waterAtCam - 0.55;
+    if (!isAboveOrSplit || camPos.y > 18) return;
+
+    const dx = camPos.x - (ev.x ?? 0);
+    const dz = camPos.z - (ev.z ?? 0);
+    const horizDist = Math.hypot(dx, dz);
+    if (horizDist > 42) return;
+
+    const proximity = THREE.MathUtils.clamp(1.28 - horizDist / 38, 0.35, 1.0);
+    const presetBoost =
+      preset === 'close-breach' || preset === 'split' ? 1.15 : 0.85;
+    const amount = THREE.MathUtils.clamp(
+      baseAmount * proximity * presetBoost,
+      0.12,
+      0.95,
+    );
+
+    cameraRig.addLensSplash(amount);
+    environment.triggerLensSplash(amount);
+  }
+
+  function dispatchEvents(events, whaleAnchors) {
     for (let i = 0; i < events.length; i += 1) {
       const ev = events[i];
       if (ev.type === 'breakthrough') {
         oceanSurface.pushRipple(ev);
         splashSystem.triggerBreakthrough(ev);
+        soundscape.triggerBreakthrough(ev);
         cameraRig.addShake(0.35);
+        maybeTriggerLensSplash(ev, 0.45);
       } else if (ev.type === 'splashdown') {
-        oceanSurface.pushRipple(ev);
-        splashSystem.triggerSplashdown(ev);
+        const splashdownEvent = {
+          ...ev,
+          spineStations: whaleAnchors.spineStations,
+        };
+        oceanSurface.pushRipple(splashdownEvent);
+        splashSystem.triggerSplashdown(splashdownEvent);
+        soundscape.triggerSplashdown(splashdownEvent);
         cameraRig.addShake(0.65);
+        maybeTriggerLensSplash(splashdownEvent, 0.78);
+      } else if (ev.type === 'blow') {
+        splashSystem.triggerSpout({
+          blowhole: whaleAnchors.blowhole,
+          upDir: whaleAnchors.upDir,
+          intensity: ev.intensity ?? ev.strength ?? 1.0,
+          velocity: currentBreachState?.velocity,
+        });
+        soundscape.triggerBlow(ev);
       }
     }
   }
 
   function advanceSubstep(clampedDt) {
-    const simDt = controller.isPaused()
-      ? 0
-      : clampedDt * controller.getTimeScale();
+    const paused = controller.isPaused();
+    const timeScale = controller.getTimeScale();
+    const simDt = paused ? 0 : clampedDt * timeScale;
 
     simTime += simDt;
 
+    const prevBlow = currentBreachState?.blowIntensity ?? 0;
     const { state, events } = controller.update(clampedDt, simTime);
     currentBreachState = state;
 
+    const preAtmo = environment.getAtmosphereState();
+    const whaleWaterLevel = getWaterHeight(
+      currentBreachState.position.x,
+      currentBreachState.position.z,
+      simTime,
+    );
+    whaleRig.update(currentBreachState, simTime, {
+      sunDirection: preAtmo.sunDirection,
+      waterLevel: whaleWaterLevel,
+    });
+    const whaleAnchors = whaleRig.getWorldAnchors();
+
     if (events.length > 0) {
-      dispatchEvents(events);
+      dispatchEvents(events, whaleAnchors);
     }
 
-    whaleRig.update(currentBreachState, simTime);
-    const whaleAnchors = whaleRig.getWorldAnchors();
+    const nextBlow = currentBreachState.blowIntensity ?? 0;
+    if (
+      !paused &&
+      prevBlow <= 0.35 &&
+      nextBlow > 0.35 &&
+      whaleAnchors.blowhole &&
+      whaleAnchors.blowhole.y >
+        getWaterHeight(
+          whaleAnchors.blowhole.x,
+          whaleAnchors.blowhole.z,
+          simTime,
+        )
+    ) {
+      splashSystem.triggerSpout({
+        blowhole: whaleAnchors.blowhole,
+        upDir: whaleAnchors.upDir,
+        intensity: nextBlow,
+        velocity: currentBreachState.velocity,
+      });
+    }
 
     const camStatus = cameraRig.update({
       dt: clampedDt,
@@ -162,11 +315,15 @@ function initWhaleScene() {
       breachState: currentBreachState,
       getWaterHeight,
     });
+    lastCamStatus = camStatus;
 
     const envState = environment.update({
       dt: clampedDt,
       cameraPosition: cameraRig.camera.position,
       waterHeightAtCamera: camStatus.waterHeightAtCamera,
+      waterlineFraction: camStatus.waterlineFraction,
+      lensWetness: camStatus.lensWetness,
+      time: simTime,
     });
 
     oceanSurface.update({
@@ -178,6 +335,7 @@ function initWhaleScene() {
       fogDensity: envState.fogDensity,
       waterDome: currentBreachState.waterDome,
       mood: envState.mood,
+      whaleAnchors,
     });
 
     splashSystem.update({
@@ -187,17 +345,20 @@ function initWhaleScene() {
       whaleAnchors,
       getWaterHeight,
       sunColor: envState.sunColor,
+      sunDirection: envState.sunDirection,
     });
 
-    hud.update({
-      phaseName: currentBreachState.phaseName,
-      progress: currentBreachState.progress,
-      elevation: currentBreachState.position.y,
-      paused: controller.isPaused(),
-      speed: controller.getTimeScale(),
-      camera: cameraRig.getPreset(),
-      mood: environment.getMood(),
+    soundscape.update({
+      dt: clampedDt,
+      time: simTime,
+      breachState: currentBreachState,
+      isSubmerged: camStatus.isSubmerged,
+      waterlineFraction: camStatus.waterlineFraction,
+      timeScale,
+      paused,
     });
+
+    syncHud();
   }
 
   function stepFrame(rawDt = 1 / 60) {
@@ -228,7 +389,8 @@ function initWhaleScene() {
   stepFrame(1 / 60);
 
   let rafId = 0;
-  let lastTimestamp = performance.now();
+  let lastTimestamp =
+    typeof performance !== 'undefined' ? performance.now() : Date.now();
 
   function animate(now) {
     rafId = window.requestAnimationFrame(animate);
@@ -246,11 +408,17 @@ function initWhaleScene() {
     whaleRig,
     oceanSurface,
     splashSystem,
+    soundscape,
+    hud,
+    variants: BREACH_VARIANTS,
     triggerBreach,
     togglePause,
     setSpeed,
     setCameraPreset,
     setMood,
+    setVariant,
+    toggleSound,
+    triggerBlow,
     stepFrame,
     getStatus() {
       const state = controller.getState();
@@ -258,12 +426,19 @@ function initWhaleScene() {
       const camPos = cameraRig.camera.position;
       const waterAtOrigin = getWaterHeight(0, 0, simTime);
       const waterAtCamera = getWaterHeight(camPos.x, camPos.z, simTime);
+      const lensWetness = Math.max(
+        cameraRig.getLensWetness(),
+        environment.getLensWetness(),
+      );
       return {
         simTime,
         frameCount,
         paused: controller.isPaused(),
         timeScale: controller.getTimeScale(),
         progress: state.progress,
+        variant: controller.getVariant(),
+        activeVariant: state.variant,
+        blowIntensity: state.blowIntensity ?? 0,
         phaseName: state.phaseName,
         phaseLabel: hud.getPhaseLabel(state.phaseName),
         whalePosition: { ...state.position },
@@ -273,9 +448,15 @@ function initWhaleScene() {
         cameraPreset: cameraRig.getPreset(),
         cameraPosition: { x: camPos.x, y: camPos.y, z: camPos.z },
         cameraTarget: { x: target.x, y: target.y, z: target.z },
-        isCameraSubmerged: camPos.y < waterAtCamera,
+        fov: cameraRig.camera.fov,
+        isCameraSubmerged: lastCamStatus
+          ? lastCamStatus.isSubmerged
+          : camPos.y < waterAtCamera,
+        waterlineFraction: lastCamStatus?.waterlineFraction ?? 0,
+        lensWetness,
         shakeIntensity: cameraRig.getShakeIntensity(),
         mood: environment.getMood(),
+        soundEnabled: soundscape.isEnabled(),
         activeRippleCount: Array.isArray(oceanSurface.ripples)
           ? oceanSurface.ripples.length
           : 0,
@@ -285,9 +466,10 @@ function initWhaleScene() {
       window.cancelAnimationFrame(rafId);
       window.removeEventListener('resize', handleResize);
       hud.dispose();
+      soundscape.dispose();
       cameraRig.dispose();
       environment.dispose();
-      renderer.dispose();
+      renderer?.dispose();
     },
   };
 
@@ -295,4 +477,9 @@ function initWhaleScene() {
   return debugHandle;
 }
 
-initWhaleScene();
+if (
+  typeof document !== 'undefined' &&
+  document.getElementById('scene-canvas')
+) {
+  initWhaleScene();
+}
