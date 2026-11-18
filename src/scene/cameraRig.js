@@ -6,23 +6,53 @@ export const CAMERA_PRESETS = {
     label: 'Low-Angle',
     position: { x: 18, y: 1.8, z: 21 },
     target: { x: 0, y: 1.1, z: 3.0 },
+    fov: 35,
   },
   'close-breach': {
     label: 'Close Breach',
     position: { x: 11, y: 2.1, z: 13.5 },
     target: { x: 0, y: 1.0, z: 1.5 },
+    fov: 56,
   },
   underwater: {
     label: 'Underwater',
     position: { x: 9.5, y: -6.0, z: 10.5 },
     target: { x: 0, y: 1.5, z: 2.0 },
+    fov: 64,
   },
   orbit: {
     label: 'Free Orbit',
     position: { x: 26, y: 11, z: 28 },
     target: { x: 0, y: 2.2, z: 3.5 },
+    fov: 48,
+  },
+  split: {
+    label: 'Split Waterline',
+    position: { x: 12.5, y: 0.0, z: 14.0 },
+    target: { x: 0, y: 0.8, z: 2.2 },
+    fov: 60,
+  },
+  aerial: {
+    label: 'Aerial Drone',
+    position: { x: 14.0, y: 34.0, z: 16.0 },
+    target: { x: 0, y: 0.5, z: 4.5 },
+    fov: 44,
   },
 };
+
+const DOME_HALF_SPAN = 0.55;
+const MAX_BOAT_ROLL_RAD = THREE.MathUtils.degToRad(2.0);
+
+function computeWaterlineFraction(relY) {
+  if (relY >= DOME_HALF_SPAN) return 0;
+  if (relY <= -DOME_HALF_SPAN) return 1;
+  const norm = Math.abs(relY) / DOME_HALF_SPAN;
+  return THREE.MathUtils.clamp(
+    0.5 - 0.5 * Math.sign(relY) * Math.pow(norm, 1.35),
+    0,
+    1,
+  );
+}
 
 export function createCameraRig({
   camera: providedCamera = null,
@@ -30,8 +60,9 @@ export function createCameraRig({
   initialPreset = 'low-angle',
   aspect = 16 / 9,
 } = {}) {
+  const initialFov = CAMERA_PRESETS[initialPreset]?.fov ?? 48;
   const camera =
-    providedCamera ?? new THREE.PerspectiveCamera(48, aspect, 0.25, 1600);
+    providedCamera ?? new THREE.PerspectiveCamera(initialFov, aspect, 0.25, 1600);
 
   const controls = new OrbitControls(camera, domElement);
   controls.enableDamping = true;
@@ -51,8 +82,11 @@ export function createCameraRig({
   const appliedShakeOffset = new THREE.Vector3();
 
   let orbitTransitionActive = false;
+  let pendingSplitSurfaceSnap = false;
   let shakeIntensity = 0;
   let shakeClock = 0;
+  let lensWetness = 0;
+  let currentRoll = 0;
 
   controls.addEventListener('start', () => {
     orbitTransitionActive = false;
@@ -65,12 +99,27 @@ export function createCameraRig({
     }
   }
 
+  function resetCameraUp() {
+    currentRoll = 0;
+    camera.up.set(0, 1, 0);
+  }
+
   function applyPresetState(presetKey, immediate = false) {
     removeLastShake();
     const preset = CAMERA_PRESETS[presetKey];
     controls.enabled = presetKey === 'orbit';
+
     if (immediate) {
       orbitTransitionActive = false;
+      pendingSplitSurfaceSnap = presetKey === 'split';
+      resetCameraUp();
+
+      const targetFov = preset.fov ?? 48;
+      if (camera.fov !== targetFov) {
+        camera.fov = targetFov;
+        camera.updateProjectionMatrix();
+      }
+
       basePosition.set(preset.position.x, preset.position.y, preset.position.z);
       baseTarget.set(preset.target.x, preset.target.y, preset.target.z);
       camera.position.copy(basePosition);
@@ -81,8 +130,18 @@ export function createCameraRig({
       }
     } else if (presetKey === 'orbit') {
       orbitTransitionActive = true;
+      pendingSplitSurfaceSnap = false;
+      resetCameraUp();
     } else {
       orbitTransitionActive = false;
+      pendingSplitSurfaceSnap = false;
+      if (
+        presetKey === 'aerial' ||
+        presetKey === 'underwater' ||
+        presetKey === 'split'
+      ) {
+        resetCameraUp();
+      }
       basePosition.copy(camera.position);
       baseTarget.copy(controls.target);
     }
@@ -113,6 +172,15 @@ export function createCameraRig({
     return shakeIntensity;
   }
 
+  function addLensSplash(amount = 0.6) {
+    if (!Number.isFinite(amount) || amount <= 0) return;
+    lensWetness = Math.min(1.0, lensWetness + amount);
+  }
+
+  function getLensWetness() {
+    return lensWetness;
+  }
+
   function resize(width, height) {
     const safeWidth = Math.max(1, width);
     const safeHeight = Math.max(1, height);
@@ -132,10 +200,31 @@ export function createCameraRig({
     const sampleWater = (x, z) =>
       typeof getWaterHeight === 'function' ? getWaterHeight(x, z, time) : 0;
 
+    // Smooth per-preset focal length (FOV) interpolation
+    const targetFov = CAMERA_PRESETS[currentPreset]?.fov ?? 48;
+    if (Math.abs(camera.fov - targetFov) > 1e-4) {
+      const fovAlpha = 1 - Math.exp(-5.4 * safeDt);
+      const nextFov = THREE.MathUtils.lerp(camera.fov, targetFov, fovAlpha);
+      camera.fov = Math.abs(nextFov - targetFov) < 5e-4 ? targetFov : nextFov;
+      camera.updateProjectionMatrix();
+    }
+
+    // Smooth ~4.5s lens wetness decay
+    if (lensWetness > 0 && safeDt > 0) {
+      lensWetness = Math.max(
+        0,
+        lensWetness * Math.exp(-0.85 * safeDt) - 0.008 * safeDt,
+      );
+      if (lensWetness < 1e-4) {
+        lensWetness = 0;
+      }
+    }
+
     const whalePos = breachState?.position ?? { x: 0, y: 0, z: 0 };
     const domeHeight = breachState?.waterDome?.height ?? 0;
 
     if (currentPreset === 'orbit') {
+      resetCameraUp();
       if (orbitTransitionActive) {
         const preset = CAMERA_PRESETS.orbit;
         desiredPosition.set(
@@ -162,6 +251,7 @@ export function createCameraRig({
       const waveAtPreset = sampleWater(preset.position.x, preset.position.z);
       let posDampRate = 4.6;
       let targetDampRate = 5.4;
+      let posYOverrideAlpha = null;
 
       if (currentPreset === 'low-angle') {
         const bobX = Math.sin(time * 0.42) * 0.26;
@@ -226,6 +316,67 @@ export function createCameraRig({
 
         posDampRate = 6.2;
         targetDampRate = 7.4;
+      } else if (currentPreset === 'split') {
+        const swayX = Math.sin(time * 0.38) * 0.14;
+        const swayZ = Math.cos(time * 0.33) * 0.12;
+        const swayY = Math.sin(time * 0.92) * 0.008;
+        const splitX = preset.position.x + swayX;
+        const splitZ = preset.position.z + swayZ;
+        const waveAtSplit = sampleWater(splitX, splitZ);
+        const targetSplitY = waveAtSplit + 0.04 + swayY;
+
+        desiredPosition.set(splitX, targetSplitY, splitZ);
+
+        const verticalTrack =
+          whalePos.y < 0
+            ? Math.max(-1.0, whalePos.y * 0.07)
+            : whalePos.y * 0.35 + Math.max(0, domeHeight) * 0.22;
+        desiredTarget.set(
+          whalePos.x * 0.32,
+          preset.target.y + verticalTrack,
+          preset.target.z +
+            THREE.MathUtils.clamp(whalePos.z - 1.0, -2.5, 8.5) * 0.34,
+        );
+
+        posDampRate = 5.6;
+        targetDampRate = 6.2;
+
+        if (pendingSplitSurfaceSnap) {
+          basePosition.set(splitX, targetSplitY, splitZ);
+          pendingSplitSurfaceSnap = false;
+        } else if (Math.abs(basePosition.y - targetSplitY) < 0.45) {
+          posYOverrideAlpha = 1 - Math.exp(-18.0 * safeDt);
+        }
+      } else if (currentPreset === 'aerial') {
+        const baseDx = preset.position.x - preset.target.x;
+        const baseDz = preset.position.z - preset.target.z;
+        const baseRadius = Math.hypot(baseDx, baseDz);
+        const baseTheta = Math.atan2(baseDx, baseDz);
+        const theta = baseTheta + time * 0.085;
+        const radius = baseRadius + Math.sin(time * 0.24) * 1.35;
+        const airborneLift = Math.max(0, whalePos.y) * 0.18;
+        const droneY =
+          preset.position.y + Math.sin(time * 0.32) * 0.95 + airborneLift;
+
+        desiredPosition.set(
+          preset.target.x + Math.sin(theta) * radius,
+          Math.max(waveAtPreset + 12.0, droneY),
+          preset.target.z + Math.cos(theta) * radius,
+        );
+
+        const verticalTrack =
+          whalePos.y < 0
+            ? Math.max(-1.6, whalePos.y * 0.09)
+            : whalePos.y * 0.28 + Math.max(0, domeHeight) * 0.24;
+        desiredTarget.set(
+          whalePos.x * 0.45,
+          preset.target.y + verticalTrack,
+          preset.target.z +
+            THREE.MathUtils.clamp(whalePos.z - 2.0, -4.0, 8.5) * 0.42,
+        );
+
+        posDampRate = 3.4;
+        targetDampRate = 4.5;
       } else {
         // underwater
         const swayX = Math.sin(time * 0.45) * 0.22;
@@ -250,8 +401,58 @@ export function createCameraRig({
 
       const posAlpha = 1 - Math.exp(-posDampRate * safeDt);
       const targetAlpha = 1 - Math.exp(-targetDampRate * safeDt);
-      basePosition.lerp(desiredPosition, posAlpha);
+      if (posYOverrideAlpha !== null) {
+        basePosition.x = THREE.MathUtils.lerp(
+          basePosition.x,
+          desiredPosition.x,
+          posAlpha,
+        );
+        basePosition.y = THREE.MathUtils.lerp(
+          basePosition.y,
+          desiredPosition.y,
+          posYOverrideAlpha,
+        );
+        basePosition.z = THREE.MathUtils.lerp(
+          basePosition.z,
+          desiredPosition.z,
+          posAlpha,
+        );
+      } else {
+        basePosition.lerp(desiredPosition, posAlpha);
+      }
       baseTarget.lerp(desiredTarget, targetAlpha);
+
+      // Wave-slope boat horizon roll (±2.0° max) in low-angle and close-breach
+      if (
+        currentPreset === 'low-angle' ||
+        currentPreset === 'close-breach'
+      ) {
+        const waveDiff =
+          sampleWater(basePosition.x + 1.2, basePosition.z) -
+          sampleWater(basePosition.x - 1.2, basePosition.z);
+        const localSlope = waveDiff / 2.4;
+        const targetRoll = THREE.MathUtils.clamp(
+          Math.atan(localSlope) * 0.55,
+          -MAX_BOAT_ROLL_RAD,
+          MAX_BOAT_ROLL_RAD,
+        );
+        const rollAlpha = 1 - Math.exp(-6.5 * safeDt);
+        currentRoll = THREE.MathUtils.lerp(currentRoll, targetRoll, rollAlpha);
+        if (Math.abs(currentRoll) < 1e-6) {
+          resetCameraUp();
+        } else {
+          const fwdX = baseTarget.x - basePosition.x;
+          const fwdZ = baseTarget.z - basePosition.z;
+          const fwdLen = Math.hypot(fwdX, fwdZ);
+          const rightX = fwdLen > 1e-5 ? -fwdZ / fwdLen : 1;
+          const rightZ = fwdLen > 1e-5 ? fwdX / fwdLen : 0;
+          const sinR = Math.sin(currentRoll);
+          const cosR = Math.cos(currentRoll);
+          camera.up.set(rightX * sinR, cosR, rightZ * sinR).normalize();
+        }
+      } else {
+        resetCameraUp();
+      }
 
       camera.position.copy(basePosition);
       controls.target.copy(baseTarget);
@@ -285,6 +486,12 @@ export function createCameraRig({
           if (camera.position.y + appliedShakeOffset.y < minSafeY) {
             appliedShakeOffset.y = minSafeY - camera.position.y;
           }
+        } else if (currentPreset === 'split') {
+          appliedShakeOffset.y = THREE.MathUtils.clamp(
+            appliedShakeOffset.y * 0.35,
+            -0.12,
+            0.12,
+          );
         }
 
         camera.position.add(appliedShakeOffset);
@@ -298,13 +505,18 @@ export function createCameraRig({
       camera.position.x,
       camera.position.z,
     );
+    const relY = camera.position.y - waterHeightAtCamera;
+    const waterlineFraction = computeWaterlineFraction(relY);
     const isSubmerged = camera.position.y < waterHeightAtCamera;
 
     return {
       preset: currentPreset,
       isSubmerged,
+      waterlineFraction,
       waterHeightAtCamera,
       shakeIntensity,
+      lensWetness,
+      fov: camera.fov,
     };
   }
 
@@ -324,6 +536,8 @@ export function createCameraRig({
     getTarget,
     addShake,
     getShakeIntensity,
+    addLensSplash,
+    getLensWetness,
     resize,
     update,
     dispose,
