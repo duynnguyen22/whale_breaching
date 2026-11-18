@@ -3,6 +3,8 @@ import { WAVE_COMPONENTS } from '../math/oceanMath.js';
 
 const TWO_PI = Math.PI * 2;
 const MAX_RIPPLE_SLOTS = 6;
+const WHALE_SPINE_SLOTS = 8;
+const WHALE_FLIPPER_SLOTS = 6;
 const MAX_RIPPLE_AGE = 8.5;
 const RIPPLE_WAVELENGTH = 3.6;
 const RIPPLE_K = TWO_PI / RIPPLE_WAVELENGTH;
@@ -355,6 +357,9 @@ const OCEAN_FRAGMENT_SHADER = /* glsl */ `
   uniform float uOceanRadius;
   uniform float uMoodSubsurface;
   uniform float uMoodGlitter;
+  uniform vec4 uWhaleSpine[8];
+  uniform vec4 uWhaleFlippers[6];
+  uniform float uWhalePresent;
 
   varying vec3 vWorldPos;
   varying vec3 vRestPos;
@@ -404,6 +409,58 @@ const OCEAN_FRAGMENT_SHADER = /* glsl */ `
     return vec2(hx - h0, hz - h0) * (1.85 * distAtten);
   }
 
+  // Evaluates refracted ray optical proximity to a submerged capsule segment (0m..10m below surface)
+  vec3 evalSubsurfaceCapsule(vec3 rayOrigin, vec3 rayDir, vec4 segA, vec4 segB, float radiusScale, float haloPad) {
+    if (segA.w <= 0.001) return vec3(0.0, 20.0, 0.0);
+
+    vec3 a = segA.xyz;
+    vec3 b = segB.w > 0.001 ? segB.xyz : segA.xyz;
+    float rA = segA.w * radiusScale;
+    float rB = (segB.w > 0.001 ? segB.w : segA.w) * radiusScale;
+
+    vec3 ab = b - a;
+    vec3 ap = rayOrigin - a;
+    float ab2 = dot(ab, ab);
+    float u = 0.0;
+
+    if (ab2 > 1e-4) {
+      float dDotAb = dot(rayDir, ab);
+      float apDotD = dot(ap, rayDir);
+      float apDotAb = dot(ap, ab);
+      float denom = ab2 - dDotAb * dDotAb;
+      if (denom > 1e-5) {
+        u = clamp((apDotAb - apDotD * dDotAb) / denom, 0.0, 1.0);
+      } else {
+        u = 0.5;
+      }
+    }
+
+    vec3 segPt = a + ab * u;
+    float tRay = max(0.0, dot(segPt - rayOrigin, rayDir));
+    vec3 rayPt = rayOrigin + rayDir * tRay;
+
+    if (ab2 > 1e-4) {
+      u = clamp(dot(rayPt - a, ab) / ab2, 0.0, 1.0);
+      segPt = a + ab * u;
+      tRay = max(0.0, dot(segPt - rayOrigin, rayDir));
+      rayPt = rayOrigin + rayDir * tRay;
+    }
+
+    float subDepth = rayOrigin.y - segPt.y;
+    float radius = mix(rA, rB, u);
+    if (subDepth < -radius * 0.55 || subDepth > 11.8) {
+      return vec3(0.0, 20.0, tRay);
+    }
+
+    float effDepth = max(0.0, subDepth);
+    float scatterBlur = haloPad + 0.11 * effDepth;
+    float dist = length(rayPt - segPt);
+    float radialMask = 1.0 - smoothstep(radius * 0.35, radius + scatterBlur, dist);
+    float depthWindow = smoothstep(-radius * 0.55, 0.10, subDepth) * (1.0 - smoothstep(8.4, 11.6, effDepth));
+
+    return vec3(radialMask * depthWindow, effDepth, tRay);
+  }
+
   void main() {
     vec3 toCam = cameraPosition - vWorldPos;
     float camDist = length(toCam);
@@ -446,7 +503,70 @@ const OCEAN_FRAGMENT_SHADER = /* glsl */ `
       float sssFactor = clamp((crestThinness * 0.72 + domeThinness * 1.15) * (0.35 + 0.65 * backLight + 0.3 * sunGrazing), 0.0, 1.35);
       waterBody += uScatterColor * sssFactor * uMoodSubsurface;
 
-      // Combine refracted ocean body + Fresnel sky reflection
+      // Subsurface refracted whale silhouette & glowing turquoise-white pectoral wings (0m..10m below surface)
+      if (uWhalePresent > 0.5 && camDist < 190.0) {
+        vec3 underRay = refract(-V, N, 0.75);
+        if (length(underRay) < 0.001) {
+          underRay = vec3(0.0, -1.0, 0.0);
+        } else {
+          underRay = normalize(underRay);
+        }
+
+        float bodySilhouette = 0.0;
+        for (int i = 0; i < 7; i++) {
+          vec3 hit = evalSubsurfaceCapsule(vWorldPos, underRay, uWhaleSpine[i], uWhaleSpine[i + 1], 1.12, 0.42);
+          if (hit.x > 0.001) {
+            float beerBody = exp(-hit.y * 0.15 - hit.z * 0.025);
+            bodySilhouette = max(bodySilhouette, hit.x * beerBody);
+          }
+        }
+
+        float wingGlow = 0.0;
+        float wingDepth = 4.0;
+        for (int i = 0; i < 2; i++) {
+          vec3 hitL = evalSubsurfaceCapsule(vWorldPos, underRay, uWhaleFlippers[i], uWhaleFlippers[i + 1], 1.42, 0.48);
+          if (hitL.x > 0.001) {
+            float beerWingL = exp(-hitL.y * 0.125 - hitL.z * 0.022);
+            float contribL = hitL.x * beerWingL;
+            if (contribL > wingGlow) {
+              wingGlow = contribL;
+              wingDepth = hitL.y;
+            }
+          }
+
+          vec3 hitR = evalSubsurfaceCapsule(vWorldPos, underRay, uWhaleFlippers[3 + i], uWhaleFlippers[4 + i], 1.42, 0.48);
+          if (hitR.x > 0.001) {
+            float beerWingR = exp(-hitR.y * 0.125 - hitR.z * 0.022);
+            float contribR = hitR.x * beerWingR;
+            if (contribR > wingGlow) {
+              wingGlow = contribR;
+              wingDepth = hitR.y;
+            }
+          }
+        }
+
+        float distAttenWhale = 1.0 - smoothstep(110.0, 185.0, camDist);
+        bodySilhouette *= distAttenWhale;
+        wingGlow *= distAttenWhale;
+
+        // Pelagic deep body shadow over submerged 15m dorsal torso
+        vec3 pelagicSilhouette = uDeepColor * 0.32;
+        waterBody = mix(waterBody, pelagicSilhouette, clamp(bodySilhouette * 0.80, 0.0, 0.80));
+
+        // Unmistakable turquoise-white humpback pectoral wing glow (#c8f4f0 shallow -> #38d6c8 deeper via Beer-Lambert)
+        if (wingGlow > 0.001) {
+          vec3 wingNearWhite = vec3(0.784, 0.957, 0.941); // #c8f4f0
+          vec3 wingTurquoise = vec3(0.220, 0.839, 0.784); // #38d6c8
+          float depthBlend = clamp(wingDepth / 3.4, 0.0, 1.0);
+          vec3 beerSpectrum = exp(-wingDepth * vec3(0.24, 0.08, 0.10));
+          float sunIrradiance = clamp(0.48 + 0.52 * max(L.y, 0.0), 0.38, 1.05);
+          vec3 wingSubsurfaceCol = mix(wingNearWhite, wingTurquoise, depthBlend) * beerSpectrum * sunIrradiance;
+          waterBody = mix(waterBody, wingSubsurfaceCol, clamp(wingGlow * 0.88, 0.0, 0.86));
+          waterBody += wingTurquoise * wingGlow * 0.18 * uMoodSubsurface;
+        }
+      }
+
+      // Combine refracted ocean body + Fresnel sky reflection (grazing angles naturally reflect sky)
       vec3 color = mix(waterBody, skyRefl, fresnel);
 
       // Blazing sun specular path (tight solar disk + shimmering micro-ripple glitter trail)
@@ -555,6 +675,199 @@ const MOOD_PRESETS = {
   },
 };
 
+function isValidAnchorPoint(pt) {
+  return Boolean(
+    pt &&
+      Number.isFinite(pt.x) &&
+      Number.isFinite(pt.y) &&
+      Number.isFinite(pt.z)
+  );
+}
+
+function refractIntoWater(viewDir, normal, eta = 0.75) {
+  // Incident ray from camera into water is -viewDir
+  const ix = -viewDir.x;
+  const iy = -viewDir.y;
+  const iz = -viewDir.z;
+  const nDotI = normal.x * ix + normal.y * iy + normal.z * iz;
+  const k = 1 - eta * eta * (1 - nDotI * nDotI);
+  if (k < 0) {
+    return { x: 0, y: -1, z: 0 };
+  }
+  const s = eta * nDotI + Math.sqrt(k);
+  const rx = eta * ix - s * normal.x;
+  const ry = eta * iy - s * normal.y;
+  const rz = eta * iz - s * normal.z;
+  const len = Math.hypot(rx, ry, rz);
+  if (len < 1e-4) {
+    return { x: 0, y: -1, z: 0 };
+  }
+  return { x: rx / len, y: ry / len, z: rz / len };
+}
+
+function evalSubsurfaceCapsuleCpu(rayOrigin, rayDir, segA, segB, radiusScale, haloPad) {
+  if (!segA || segA.w <= 0.001) return { hit: 0, depth: 20, tRay: 0 };
+
+  const ax = segA.x;
+  const ay = segA.y;
+  const az = segA.z;
+  const hasB = segB && segB.w > 0.001;
+  const bx = hasB ? segB.x : ax;
+  const by = hasB ? segB.y : ay;
+  const bz = hasB ? segB.z : az;
+  const rA = segA.w * radiusScale;
+  const rB = (hasB ? segB.w : segA.w) * radiusScale;
+
+  const abx = bx - ax;
+  const aby = by - ay;
+  const abz = bz - az;
+  const apx = rayOrigin.x - ax;
+  const apy = rayOrigin.y - ay;
+  const apz = rayOrigin.z - az;
+  const ab2 = abx * abx + aby * aby + abz * abz;
+
+  let u = 0;
+  if (ab2 > 1e-4) {
+    const dDotAb = rayDir.x * abx + rayDir.y * aby + rayDir.z * abz;
+    const apDotD = apx * rayDir.x + apy * rayDir.y + apz * rayDir.z;
+    const apDotAb = apx * abx + apy * aby + apz * abz;
+    const denom = ab2 - dDotAb * dDotAb;
+    if (denom > 1e-5) {
+      u = Math.min(1, Math.max(0, (apDotAb - apDotD * dDotAb) / denom));
+    } else {
+      u = 0.5;
+    }
+  }
+
+  let segX = ax + abx * u;
+  let segY = ay + aby * u;
+  let segZ = az + abz * u;
+  let tRay = Math.max(
+    0,
+    (segX - rayOrigin.x) * rayDir.x +
+      (segY - rayOrigin.y) * rayDir.y +
+      (segZ - rayOrigin.z) * rayDir.z
+  );
+  let rayX = rayOrigin.x + rayDir.x * tRay;
+  let rayY = rayOrigin.y + rayDir.y * tRay;
+  let rayZ = rayOrigin.z + rayDir.z * tRay;
+
+  if (ab2 > 1e-4) {
+    u = Math.min(
+      1,
+      Math.max(0, ((rayX - ax) * abx + (rayY - ay) * aby + (rayZ - az) * abz) / ab2)
+    );
+    segX = ax + abx * u;
+    segY = ay + aby * u;
+    segZ = az + abz * u;
+    tRay = Math.max(
+      0,
+      (segX - rayOrigin.x) * rayDir.x +
+        (segY - rayOrigin.y) * rayDir.y +
+        (segZ - rayOrigin.z) * rayDir.z
+    );
+    rayX = rayOrigin.x + rayDir.x * tRay;
+    rayY = rayOrigin.y + rayDir.y * tRay;
+    rayZ = rayOrigin.z + rayDir.z * tRay;
+  }
+
+  const subDepth = rayOrigin.y - segY;
+  const radius = rA + (rB - rA) * u;
+  if (subDepth < -radius * 0.55 || subDepth > 11.8) {
+    return { hit: 0, depth: 20, tRay };
+  }
+
+  const effDepth = Math.max(0, subDepth);
+  const scatterBlur = haloPad + 0.11 * effDepth;
+  const dist = Math.hypot(rayX - segX, rayY - segY, rayZ - segZ);
+  const radialMask =
+    1 - smoothstep01((dist - radius * 0.35) / Math.max(1e-4, radius + scatterBlur - radius * 0.35));
+  const depthWindow =
+    smoothstep01((subDepth + radius * 0.55) / Math.max(1e-4, 0.10 + radius * 0.55)) *
+    (1 - smoothstep01((effDepth - 8.4) / (11.6 - 8.4)));
+
+  return { hit: radialMask * depthWindow, depth: effDepth, tRay };
+}
+
+export function evaluateSubsurfaceWhaleOptics(worldPos, cameraPos, normal, uniforms) {
+  const toCamX = cameraPos.x - worldPos.x;
+  const toCamY = cameraPos.y - worldPos.y;
+  const toCamZ = cameraPos.z - worldPos.z;
+  const camDist = Math.hypot(toCamX, toCamY, toCamZ);
+  const invDist = 1 / Math.max(camDist, 1e-4);
+  const V = { x: toCamX * invDist, y: toCamY * invDist, z: toCamZ * invDist };
+  const nLen = Math.hypot(normal.x, normal.y, normal.z) || 1;
+  const N = { x: normal.x / nLen, y: normal.y / nLen, z: normal.z / nLen };
+
+  const NdotV = Math.max(0.001, N.x * V.x + N.y * V.y + N.z * V.z);
+  const fresnel = 0.02 + 0.98 * Math.pow(Math.min(1, Math.max(0, 1 - NdotV)), 5);
+
+  if (!uniforms?.uWhalePresent || uniforms.uWhalePresent.value <= 0.5 || camDist >= 190) {
+    return { bodySilhouette: 0, wingGlow: 0, fresnel, transmittedFraction: 1 - fresnel };
+  }
+
+  const underRay = refractIntoWater(V, N, 0.75);
+  const spine = uniforms.uWhaleSpine.value;
+  const flippers = uniforms.uWhaleFlippers.value;
+
+  let bodySilhouette = 0;
+  for (let i = 0; i < 7; i++) {
+    const res = evalSubsurfaceCapsuleCpu(worldPos, underRay, spine[i], spine[i + 1], 1.12, 0.42);
+    if (res.hit > 0.001) {
+      const beer = Math.exp(-res.depth * 0.15 - res.tRay * 0.025);
+      bodySilhouette = Math.max(bodySilhouette, res.hit * beer);
+    }
+  }
+
+  let wingGlow = 0;
+  let wingDepth = 4.0;
+  for (let i = 0; i < 2; i++) {
+    const resL = evalSubsurfaceCapsuleCpu(
+      worldPos,
+      underRay,
+      flippers[i],
+      flippers[i + 1],
+      1.42,
+      0.48
+    );
+    if (resL.hit > 0.001) {
+      const contribL = resL.hit * Math.exp(-resL.depth * 0.125 - resL.tRay * 0.022);
+      if (contribL > wingGlow) {
+        wingGlow = contribL;
+        wingDepth = resL.depth;
+      }
+    }
+
+    const resR = evalSubsurfaceCapsuleCpu(
+      worldPos,
+      underRay,
+      flippers[3 + i],
+      flippers[4 + i],
+      1.42,
+      0.48
+    );
+    if (resR.hit > 0.001) {
+      const contribR = resR.hit * Math.exp(-resR.depth * 0.125 - resR.tRay * 0.022);
+      if (contribR > wingGlow) {
+        wingGlow = contribR;
+        wingDepth = resR.depth;
+      }
+    }
+  }
+
+  const distAtten = 1 - smoothstep01((camDist - 110) / (185 - 110));
+  bodySilhouette *= distAtten;
+  wingGlow *= distAtten;
+
+  return {
+    bodySilhouette,
+    wingGlow,
+    wingDepth,
+    fresnel,
+    transmittedFraction: 1 - fresnel,
+  };
+}
+
 export function createOceanSurface({ radius = 460 } = {}) {
   const geometry = createPolarOceanGeometry({ radius });
 
@@ -569,6 +882,15 @@ export function createOceanSurface({ radius = 460 } = {}) {
   );
   const rippleSpeeds = new Float32Array(MAX_RIPPLE_SLOTS).fill(8.5);
 
+  const whaleSpineVecs = Array.from(
+    { length: WHALE_SPINE_SLOTS },
+    () => new THREE.Vector4(0, -100, 0, 0)
+  );
+  const whaleFlipperVecs = Array.from(
+    { length: WHALE_FLIPPER_SLOTS },
+    () => new THREE.Vector4(0, -100, 0, 0)
+  );
+
   const uniforms = {
     uTime: { value: 0 },
     uWaves: { value: waveVecs },
@@ -576,6 +898,9 @@ export function createOceanSurface({ radius = 460 } = {}) {
     uDome: { value: new THREE.Vector4(0, 0, 4.8, 0) },
     uRipples: { value: rippleVecs },
     uRippleSpeeds: { value: rippleSpeeds },
+    uWhaleSpine: { value: whaleSpineVecs },
+    uWhaleFlippers: { value: whaleFlipperVecs },
+    uWhalePresent: { value: 0.0 },
     uSunDirection: { value: new THREE.Vector3(0.45, 0.22, -0.86).normalize() },
     uSunColor: { value: new THREE.Color('#ffd394') },
     uHorizonColor: { value: new THREE.Color('#e89968') },
@@ -616,6 +941,143 @@ export function createOceanSurface({ radius = 460 } = {}) {
         rippleSpeeds[i] = 8.5;
       }
     }
+  }
+
+  function populateFlipperWingSlots(offset, trailingList, fallbackTip, chestStation) {
+    const validTrail = Array.isArray(trailingList)
+      ? trailingList.filter(isValidAnchorPoint)
+      : [];
+
+    if (validTrail.length >= 3) {
+      const i0 = 0;
+      const i1 = Math.floor((validTrail.length - 1) * 0.5);
+      const i2 = validTrail.length - 1;
+      const picks = [validTrail[i0], validTrail[i1], validTrail[i2]];
+      for (let k = 0; k < 3; k++) {
+        const pt = picks[k];
+        const rad = Math.max(0.15, Number.isFinite(pt.radius) ? pt.radius : 0.45);
+        whaleFlipperVecs[offset + k].set(pt.x, pt.y, pt.z, rad);
+      }
+      return true;
+    }
+
+    if (validTrail.length === 2) {
+      const a = validTrail[0];
+      const b = validTrail[1];
+      const rA = Math.max(0.15, Number.isFinite(a.radius) ? a.radius : 0.48);
+      const rB = Math.max(0.15, Number.isFinite(b.radius) ? b.radius : 0.36);
+      whaleFlipperVecs[offset].set(a.x, a.y, a.z, rA);
+      whaleFlipperVecs[offset + 1].set(
+        (a.x + b.x) * 0.5,
+        (a.y + b.y) * 0.5,
+        (a.z + b.z) * 0.5,
+        (rA + rB) * 0.5
+      );
+      whaleFlipperVecs[offset + 2].set(b.x, b.y, b.z, rB);
+      return true;
+    }
+
+    if (validTrail.length === 1) {
+      const pt = validTrail[0];
+      const rad = Math.max(0.15, Number.isFinite(pt.radius) ? pt.radius : 0.5);
+      for (let k = 0; k < 3; k++) {
+        whaleFlipperVecs[offset + k].set(pt.x, pt.y, pt.z, rad);
+      }
+      return true;
+    }
+
+    if (isValidAnchorPoint(fallbackTip)) {
+      const tipRad = Math.max(
+        0.18,
+        Number.isFinite(fallbackTip.radius) ? fallbackTip.radius : 0.38
+      );
+      if (isValidAnchorPoint(chestStation)) {
+        const fractions = [0.24, 0.62, 1.0];
+        const radii = [0.58, 0.48, tipRad];
+        for (let k = 0; k < 3; k++) {
+          const f = fractions[k];
+          whaleFlipperVecs[offset + k].set(
+            chestStation.x + (fallbackTip.x - chestStation.x) * f,
+            chestStation.y + (fallbackTip.y - chestStation.y) * f,
+            chestStation.z + (fallbackTip.z - chestStation.z) * f,
+            radii[k]
+          );
+        }
+      } else {
+        for (let k = 0; k < 3; k++) {
+          whaleFlipperVecs[offset + k].set(
+            fallbackTip.x,
+            fallbackTip.y,
+            fallbackTip.z,
+            Math.max(0.45, tipRad)
+          );
+        }
+      }
+      return true;
+    }
+
+    for (let k = 0; k < 3; k++) {
+      whaleFlipperVecs[offset + k].set(0, -100, 0, 0);
+    }
+    return false;
+  }
+
+  function syncWhaleUniforms(whaleAnchors) {
+    if (!whaleAnchors || typeof whaleAnchors !== 'object') {
+      uniforms.uWhalePresent.value = 0.0;
+      for (let i = 0; i < WHALE_SPINE_SLOTS; i++) {
+        whaleSpineVecs[i].set(0, -100, 0, 0);
+      }
+      for (let i = 0; i < WHALE_FLIPPER_SLOTS; i++) {
+        whaleFlipperVecs[i].set(0, -100, 0, 0);
+      }
+      return;
+    }
+
+    const validSpine = Array.isArray(whaleAnchors.spineStations)
+      ? whaleAnchors.spineStations.filter(isValidAnchorPoint)
+      : [];
+
+    let hasSpine = false;
+    if (validSpine.length > 0) {
+      hasSpine = true;
+      for (let i = 0; i < WHALE_SPINE_SLOTS; i++) {
+        if (i < validSpine.length) {
+          const st = validSpine[i];
+          const rad = Math.max(0.1, Number.isFinite(st.radius) ? st.radius : 0.85);
+          whaleSpineVecs[i].set(st.x, st.y, st.z, rad);
+        } else {
+          whaleSpineVecs[i].set(0, -100, 0, 0);
+        }
+      }
+    } else {
+      for (let i = 0; i < WHALE_SPINE_SLOTS; i++) {
+        whaleSpineVecs[i].set(0, -100, 0, 0);
+      }
+    }
+
+    const chestRef =
+      validSpine.length >= 3
+        ? validSpine[2]
+        : validSpine.length > 0
+          ? validSpine[0]
+          : null;
+
+    const hasLeftFlipper = populateFlipperWingSlots(
+      0,
+      whaleAnchors.flipperTrailingL,
+      whaleAnchors.flipperL,
+      chestRef
+    );
+    const hasRightFlipper = populateFlipperWingSlots(
+      3,
+      whaleAnchors.flipperTrailingR,
+      whaleAnchors.flipperR,
+      chestRef
+    );
+
+    uniforms.uWhalePresent.value =
+      hasSpine || hasLeftFlipper || hasRightFlipper ? 1.0 : 0.0;
   }
 
   function pushRipple(event = {}) {
@@ -660,6 +1122,7 @@ export function createOceanSurface({ radius = 460 } = {}) {
     waterDome,
     dome,
     mood,
+    whaleAnchors,
   } = {}) {
     lastTime = time;
     uniforms.uTime.value = time;
@@ -699,6 +1162,8 @@ export function createOceanSurface({ radius = 460 } = {}) {
     } else {
       uniforms.uDome.value.set(0, 0, 4.8, 0);
     }
+
+    syncWhaleUniforms(whaleAnchors);
 
     // Prune expired ripples in-place so shared array references stay valid
     for (let i = ripples.length - 1; i >= 0; i--) {
