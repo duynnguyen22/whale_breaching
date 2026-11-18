@@ -589,7 +589,8 @@ const OCEAN_FRAGMENT_SHADER = /* glsl */ `
 
       // Smooth horizon + exponential fog blend
       float radialDist = length(vRestPos.xz);
-      float horizonBlend = smoothstep(uOceanRadius * 0.68, uOceanRadius * 0.995, radialDist);
+      float safeOceanRadius = max(1.0, uOceanRadius);
+      float horizonBlend = smoothstep(safeOceanRadius * 0.68, safeOceanRadius * 0.995, radialDist);
       float fogDist = camDist * max(0.0, uFogDensity);
       float expFog = 1.0 - exp(-fogDist * fogDist);
       float totalFog = clamp(max(expFog, horizonBlend), 0.0, 1.0);

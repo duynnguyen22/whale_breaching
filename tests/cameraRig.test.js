@@ -380,7 +380,7 @@ describe('cameraRig & environment cinematography', () => {
     }
     expectBalancedGlsl(env.lensAndWaterlinePass.material.fragmentShader);
     expect(env.lensAndWaterlinePass.material.fragmentShader).toContain(
-      'evaluateDropletLayer',
+      'evaluateBokehDroplets',
     );
     expect(env.lensAndWaterlinePass.material.fragmentShader).toContain(
       'uWaterlineFraction',

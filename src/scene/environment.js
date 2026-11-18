@@ -209,14 +209,14 @@ function upgradeSkyMaterialToLinearHDR(skyMesh) {
       float skyIslandProfile( float az ) {
         // West-southwest volcanic caldera & twin-peak island group (flanks left of main view)
         float d1 = skyWrapAngle( az, -2.78 );
-        float env1 = exp( -skySqr( d1 / 0.24 ) ) * smoothstep( 0.36, 0.08, abs( d1 ) );
+        float env1 = exp( -skySqr( d1 / 0.24 ) ) * ( 1.0 - smoothstep( 0.08, 0.36, abs( d1 ) ) );
         float ridge1 = 0.56 + 0.28 * cos( d1 * 13.5 - 0.6 ) + 0.16 * ( 1.0 - abs( sin( d1 * 29.0 + 0.4 ) ) );
         float calderaNotch = 1.0 - 0.22 * exp( -skySqr( ( d1 + 0.03 ) / 0.035 ) );
         float h1 = 0.0255 * env1 * ridge1 * calderaNotch;
 
         // South-southeast coastal headland & sea-stack chain (flanks right of main view)
         float d2 = skyWrapAngle( az, -1.88 );
-        float env2 = exp( -skySqr( d2 / 0.20 ) ) * smoothstep( 0.31, 0.06, abs( d2 ) );
+        float env2 = exp( -skySqr( d2 / 0.20 ) ) * ( 1.0 - smoothstep( 0.06, 0.31, abs( d2 ) ) );
         float cliffSlope = smoothstep( -0.24, 0.12, d2 );
         float ridge2 = 0.52 + 0.30 * ( 1.0 - abs( sin( d2 * 24.0 - 0.8 ) ) ) + 0.18 * sin( d2 * 43.0 );
         float seaStack = 0.0065 * exp( -skySqr( ( d2 - 0.21 ) / 0.018 ) );
@@ -224,7 +224,7 @@ function upgradeSkyMaterialToLinearHDR(skyMesh) {
 
         // Far northeast archipelago for 360-degree orbit / aerial views
         float d3 = skyWrapAngle( az, 0.86 );
-        float env3 = exp( -skySqr( d3 / 0.28 ) ) * smoothstep( 0.40, 0.10, abs( d3 ) );
+        float env3 = exp( -skySqr( d3 / 0.28 ) ) * ( 1.0 - smoothstep( 0.10, 0.40, abs( d3 ) ) );
         float ridge3 = 0.58 + 0.26 * ( 1.0 - abs( sin( d3 * 19.0 + 1.1 ) ) ) + 0.16 * cos( d3 * 37.0 );
         float h3 = 0.0215 * env3 * ridge3;
 
@@ -314,7 +314,7 @@ function upgradeSkyMaterialToLinearHDR(skyMesh) {
       float horizonFloor = smoothstep( -0.0025, 0.0012, direction.y );
 
       if ( farIslandH > 0.0005 && direction.y < farIslandH + 0.002 ) {
-        float farMask = horizonFloor * smoothstep( farIslandH + 0.0012, farIslandH - 0.0010, direction.y );
+        float farMask = horizonFloor * ( 1.0 - smoothstep( farIslandH - 0.0010, farIslandH + 0.0012, direction.y ) );
         vec3 farRock = mix( uZenithColor * 0.42, uMidSkyColor * 0.48, 0.5 );
         vec3 farHaze = linearSky + uSunGlowColor * pow( sunAlign, 4.0 ) * 0.04;
         vec3 farCol = mix( farRock, farHaze, 0.85 );
@@ -322,7 +322,7 @@ function upgradeSkyMaterialToLinearHDR(skyMesh) {
       }
 
       if ( nearIslandH > 0.0005 && direction.y < nearIslandH + 0.002 ) {
-        float nearMask = horizonFloor * smoothstep( nearIslandH + 0.0011, nearIslandH - 0.0011, direction.y );
+        float nearMask = horizonFloor * ( 1.0 - smoothstep( nearIslandH - 0.0011, nearIslandH + 0.0011, direction.y ) );
         float relElev = clamp( direction.y / max( nearIslandH, 0.001 ), 0.0, 1.0 );
         vec3 basaltBase = mix( uZenithColor * 0.32, uMidSkyColor * 0.40, 0.45 + 0.35 * relElev );
         float seaMist = exp( -max( direction.y, 0.0 ) * 140.0 ) * 0.16;
@@ -402,15 +402,17 @@ const LensAndWaterlineShader = {
       return l > 1e-5 ? v / l : vec2( 0.0, 1.0 );
     }
 
+    float lwHash11( float p ) {
+      p = fract( p * 0.1031 );
+      p *= p + 33.33;
+      p *= p + p;
+      return fract( p );
+    }
+
     float lwHash21( vec2 p ) {
       p = fract( p * vec2( 234.34, 435.345 ) );
       p += dot( p, p + 34.23 );
       return fract( p.x * p.y );
-    }
-
-    vec2 lwHash22( vec2 p ) {
-      float n = lwHash21( p );
-      return vec2( n, lwHash21( p + n + 19.19 ) );
     }
 
     float lwNoise( vec2 p ) {
@@ -424,53 +426,92 @@ const LensAndWaterlineShader = {
       );
     }
 
-    // Returns vec3( normalX, normalY, mask ) for a grid of refractive water beads & trails
-    vec3 evaluateDropletLayer( vec2 p, float scale, float slideSpeed, float wetness ) {
-      vec2 st = p * scale;
-      float colSeed = lwHash21( vec2( floor( st.x ), scale ) );
-      float slide = uTime * slideSpeed * ( 0.55 + 0.75 * colSeed );
-      st.y += slide;
+    // Real-life front-element optics (0mm from glass, well inside minimum focus distance):
+    // Models 12 continuous, grid-free screen-space out-of-focus bokeh water patches around the
+    // lens periphery & lower frame so central whale framing stays crystal clear and rectangular
+    // grid-cell clipping is mathematically impossible.
+    // Returns vec4( refractGradX, refractGradY, dropMask, bokehRim ).
+    vec4 evaluateBokehDroplets( vec2 p, float wetness ) {
+      vec2 accumGrad = vec2( 0.0 );
+      float accumMask = 0.0;
+      float accumRim = 0.0;
 
-      vec2 cellId = floor( st );
-      vec2 local = fract( st ) - 0.5;
-      vec2 rnd = lwHash22( cellId + scale * 0.37 );
+      for ( int i = 0; i < 12; i++ ) {
+        float fi = float( i );
+        float h1 = lwHash11( fi * 3.17 + 1.23 );
+        float h2 = lwHash11( fi * 7.31 + 5.71 );
+        float h3 = lwHash11( fi * 11.13 + 9.47 );
 
-      // Staggered evaporation so smaller/sparser droplets vanish naturally as wetness decays
-      float threshold = rnd.x * 0.72;
-      float presence = smoothstep( threshold, min( 1.0, threshold + 0.26 ), wetness );
-      if ( presence <= 0.001 ) {
-        return vec3( 0.0 );
+        // Smooth temporal-only sheeting lifecycle (0 at birth & 0 at wrap -> zero spatial cells or pops)
+        float driftRate = 0.085 + 0.055 * h1;
+        float lifePhase = fract( uTime * driftRate + fi * 0.61803399 );
+        float lifeEnv = smoothstep( 0.0, 0.20, lifePhase ) * ( 1.0 - smoothstep( 0.72, 1.0, lifePhase ) );
+
+        float threshold = h3 * 0.56;
+        float presence = smoothstep( threshold, threshold + 0.32, wetness ) * lifeEnv;
+        if ( presence > 0.001 ) {
+          // Golden-angle peripheral ring biased toward lens edges & bottom
+          float ang = fi * 2.39996323 + 0.42;
+          float radial = 0.30 + 0.20 * h1;
+          vec2 uvBase = vec2( 0.5, 0.44 ) + vec2( cos( ang ) * radial * 0.94, sin( ang ) * radial * 0.82 );
+          uvBase = clamp( uvBase, vec2( 0.05, 0.08 ), vec2( 0.95, 0.93 ) );
+
+          vec2 baseCenter = vec2( ( uvBase.x - 0.5 ) * uAspect, uvBase.y - 0.5 );
+          float sheetDown = lifePhase * ( 0.045 + 0.045 * h2 ) + ( 1.0 - wetness ) * 0.024;
+          float gentleSway = sin( uTime * ( 0.42 + 0.22 * h2 ) + fi * 2.1 ) * 0.007;
+          vec2 center = baseCenter + vec2( gentleSway, -sheetDown );
+
+          // Large out-of-focus defocus radii (0.046 .. 0.138)
+          float baseRadius = mix( 0.046, 0.138, h2 * ( 0.45 + 0.55 * h1 ) );
+          float radius = max( 0.045, baseRadius * ( 0.78 + 0.22 * presence ) );
+
+          vec2 d = p - center;
+          vec2 dOval = vec2( d.x * 0.97, d.y * 1.04 );
+          float dist = length( dOval );
+
+          if ( dist < radius ) {
+            float u = dist / radius;
+            float feather = 1.0 - smoothstep( 0.0, radius, dist );
+            float gauss = exp( -2.8 * u * u );
+            float w = clamp( ( 0.56 * feather + 0.44 * gauss * feather ) * presence, 0.0, 1.0 );
+
+            // Ultra-soft out-of-focus bokeh rim glow vanishing smoothly at center & outer edge
+            float rim = exp( -lwSqr( ( u - 0.62 ) / 0.24 ) )
+              * smoothstep( 0.08, 0.44, u )
+              * ( 1.0 - smoothstep( 0.66, 1.0, u ) )
+              * presence;
+
+            // Gentle convex magnification gradient vanishing to 0 at u = 1
+            vec2 lensGrad = ( d / radius ) * feather * ( 1.0 - u * 0.35 ) * presence;
+
+            accumGrad += lensGrad;
+            accumMask = 1.0 - ( 1.0 - accumMask ) * ( 1.0 - w );
+            accumRim = 1.0 - ( 1.0 - accumRim ) * ( 1.0 - clamp( rim, 0.0, 1.0 ) );
+          }
+        }
       }
 
-      float wobble = sin( uTime * ( 1.8 + rnd.y * 2.2 ) + rnd.x * 6.2831 ) * 0.06;
-      vec2 center = ( rnd - 0.5 ) * vec2( 0.52, 0.44 ) + vec2( wobble, 0.0 );
-      vec2 d = local - center;
+      return vec4( accumGrad, accumMask, accumRim );
+    }
 
-      // Slight teardrop elongation vertically
-      vec2 dShape = vec2( d.x * 1.08, d.y * ( d.y > 0.0 ? 1.15 : 0.88 ) );
-      float radius = ( 0.14 + 0.17 * rnd.y ) * ( 0.55 + 0.45 * presence );
-      float dist = length( dShape );
-      float dropMask = smoothstep( radius, radius * 0.62, dist ) * presence;
+    // 9-tap circular disk bokeh defocus kernel around sampleUv
+    vec3 sampleBokehDisk9( vec2 centerUv, float radiusUv, float aspect ) {
+      vec2 aspectScale = vec2( 1.0 / max( aspect, 0.5 ), 1.0 ) * radiusUv;
+      vec3 sum = texture2D( tDiffuse, centerUv ).rgb * 0.20;
 
-      vec2 normXY = vec2( 0.0 );
-      if ( dropMask > 0.001 ) {
-        normXY = ( d / max( radius, 0.001 ) ) * dropMask;
-      }
+      // Inner 4-tap ring (0.54r)
+      sum += texture2D( tDiffuse, clamp( centerUv + vec2(  0.497,  0.210 ) * aspectScale, vec2( 0.001 ), vec2( 0.999 ) ) ).rgb * 0.11;
+      sum += texture2D( tDiffuse, clamp( centerUv + vec2( -0.210,  0.497 ) * aspectScale, vec2( 0.001 ), vec2( 0.999 ) ) ).rgb * 0.11;
+      sum += texture2D( tDiffuse, clamp( centerUv + vec2( -0.497, -0.210 ) * aspectScale, vec2( 0.001 ), vec2( 0.999 ) ) ).rgb * 0.11;
+      sum += texture2D( tDiffuse, clamp( centerUv + vec2(  0.210, -0.497 ) * aspectScale, vec2( 0.001 ), vec2( 0.999 ) ) ).rgb * 0.11;
 
-      // Gravity rivulet trail above sliding bead
-      if ( slideSpeed > 0.01 ) {
-        float above = local.y - center.y;
-        float trailLen = 0.42 * presence;
-        float inTrailY = smoothstep( 0.0, 0.05, above ) * smoothstep( trailLen, 0.04, above );
-        float trailWidth = radius * 0.32 * ( 1.0 - above / max( trailLen, 0.01 ) * 0.45 );
-        float trailMask = smoothstep( trailWidth, trailWidth * 0.25, abs( d.x ) ) * inTrailY * presence * 0.65;
-        float subBeads = smoothstep( 0.35, 0.85, fract( above * 9.0 - slide * 1.5 ) );
-        trailMask *= ( 0.45 + 0.55 * subBeads );
-        normXY.x += ( d.x / max( trailWidth, 0.002 ) ) * trailMask * 0.6;
-        dropMask = max( dropMask, trailMask );
-      }
+      // Outer 4-tap ring (1.00r, rotated 45 deg)
+      sum += texture2D( tDiffuse, clamp( centerUv + vec2(  0.381,  0.925 ) * aspectScale, vec2( 0.001 ), vec2( 0.999 ) ) ).rgb * 0.09;
+      sum += texture2D( tDiffuse, clamp( centerUv + vec2( -0.925,  0.381 ) * aspectScale, vec2( 0.001 ), vec2( 0.999 ) ) ).rgb * 0.09;
+      sum += texture2D( tDiffuse, clamp( centerUv + vec2( -0.381, -0.925 ) * aspectScale, vec2( 0.001 ), vec2( 0.999 ) ) ).rgb * 0.09;
+      sum += texture2D( tDiffuse, clamp( centerUv + vec2(  0.925, -0.381 ) * aspectScale, vec2( 0.001 ), vec2( 0.999 ) ) ).rgb * 0.09;
 
-      return vec3( normXY, dropMask );
+      return sum;
     }
 
     void main() {
@@ -504,8 +545,8 @@ const LensAndWaterlineShader = {
         submergeMask = ( 1.0 - smoothstep( -0.0055, 0.0055, signedDist ) ) * uSplitActive;
 
         // Surface-tension meniscus lens warp + subtle underwater wave refraction
-        refractOffset.x += meniscusSlope * 0.16 * meniscusBand;
-        refractOffset.y -= signedDist * 0.46 * meniscusBand;
+        refractOffset.x += meniscusSlope * 0.14 * meniscusBand;
+        refractOffset.y -= signedDist * 0.42 * meniscusBand;
 
         vec2 uwWobble = vec2(
           sin( vUv.y * 19.0 + uTime * 2.3 + vUv.x * 5.0 ),
@@ -514,31 +555,56 @@ const LensAndWaterlineShader = {
         refractOffset += uwWobble;
       }
 
-      // 2. Refractive Camera Lens Water Droplets & Sliding Streaks
+      // 2. Out-of-Focus Camera-Lens Bokeh Water Patches (0mm front-element optics)
       vec2 dropNormal = vec2( 0.0 );
       float dropMask = 0.0;
+      float dropRim = 0.0;
       if ( uLensWetness > 0.01 ) {
         float wet = clamp( uLensWetness, 0.0, 1.0 );
-        vec3 heroDrops = evaluateDropletLayer( p, 5.2, 0.055, wet );
-        vec3 midDrops = evaluateDropletLayer( p + vec2( 0.37, -0.21 ), 9.6, 0.11, wet * 0.92 );
-        vec3 fineMist = evaluateDropletLayer( p + vec2( -0.61, 0.43 ), 16.5, 0.0, wet * 0.82 );
+        vec4 bokeh = evaluateBokehDroplets( p, wet );
+        dropNormal = bokeh.xy;
+        dropMask = bokeh.z;
+        dropRim = bokeh.w;
 
-        dropNormal = heroDrops.xy * 1.0 + midDrops.xy * 0.72 + fineMist.xy * 0.45;
-        dropMask = clamp( max( max( heroDrops.z, midDrops.z * 0.88 ), fineMist.z * 0.68 ), 0.0, 1.0 );
+        vec2 dropOffset = -dropNormal * 0.011;
+        float dropLen = length( dropOffset );
+        if ( dropLen > 0.015 ) {
+          dropOffset *= 0.015 / dropLen;
+        }
+        refractOffset += dropOffset;
+      }
 
-        refractOffset -= dropNormal * 0.028;
+      // Strictly clamp total UV refraction offset <= 0.018 to guarantee zero smearing
+      float totalRefractLen = length( refractOffset );
+      if ( totalRefractLen > 0.018 ) {
+        refractOffset *= 0.018 / totalRefractLen;
       }
 
       vec2 sampleUv = clamp( vUv + refractOffset, vec2( 0.001 ), vec2( 0.999 ) );
       vec4 baseTex = texture2D( tDiffuse, sampleUv );
       vec3 col = baseTex.rgb;
 
-      // Subtle chromatic dispersion across meniscus & heavy droplets
-      float dispersionAmt = meniscusBand * 0.0032 + dropMask * 0.0022;
+      // Subtle chromatic dispersion across the air-water meniscus
+      float dispersionAmt = meniscusBand * 0.0028 + dropRim * 0.0010;
       if ( dispersionAmt > 0.0002 ) {
         vec2 dispDir = lwSafeNorm2( refractOffset ) * dispersionAmt;
         col.r = texture2D( tDiffuse, clamp( sampleUv + dispDir, vec2( 0.001 ), vec2( 0.999 ) ) ).r;
         col.b = texture2D( tDiffuse, clamp( sampleUv - dispDir, vec2( 0.001 ), vec2( 0.999 ) ) ).b;
+      }
+
+      // Soft 9-tap out-of-focus bokeh defocus blur & delicate sunlit bokeh rim inside lens droplets
+      if ( dropMask > 0.002 ) {
+        float wet = clamp( uLensWetness, 0.0, 1.0 );
+        float bokehBlend = smoothstep( 0.002, 0.62, dropMask ) * ( 0.52 + 0.28 * wet );
+        float blurRadius = ( 0.0028 + 0.0085 * dropMask ) * ( 0.55 + 0.45 * wet );
+        vec3 blurred = sampleBokehDisk9( sampleUv, blurRadius, uAspect );
+
+        vec2 sunDir2D = lwSafeNorm2( uSunScreenDir );
+        float sunSide = clamp( 0.55 + 0.45 * dot( lwSafeNorm2( -dropNormal + sunDir2D * 0.20 ), sunDir2D ), 0.0, 1.0 );
+        vec3 bokehGlowTint = mix( vec3( 0.84, 0.95, 1.0 ), uSunGlowColor * 0.85 + vec3( 0.34 ), 0.45 * sunSide );
+
+        col = mix( col, blurred * mix( vec3( 1.0 ), vec3( 0.97, 0.995, 1.015 ), dropMask * 0.45 ), bokehBlend );
+        col += bokehGlowTint * ( dropRim * 0.068 + dropMask * 0.018 ) * ( 0.40 + 0.60 * wet );
       }
 
       // 3. Submerged lower-frame teal absorption, shallow scatter & meniscus sunlit rim
@@ -572,21 +638,6 @@ const LensAndWaterlineShader = {
         vec3 rimColor = mix( uUnderwaterShallowColor * 0.85 + vec3( 0.22 ), uSunGlowColor * 0.95 + vec3( 0.28 ), 0.48 * sunSide );
         col = mix( col, col * 0.72 + rimColor * 0.55, meniscusBand * 0.42 );
         col += rimColor * thinCore * microBead * 0.46;
-      }
-
-      // 4. Droplet internal Fresnel shading & warm solar specular glints
-      if ( dropMask > 0.001 ) {
-        vec2 sunDir2D = lwSafeNorm2( uSunScreenDir );
-        vec3 dropN3 = normalize( vec3( dropNormal * 1.65, 0.68 ) );
-        vec3 sunDir3 = normalize( vec3( sunDir2D * 0.68, 0.73 ) );
-
-        float spec = pow( max( dot( dropN3, sunDir3 ), 0.0 ), 26.0 );
-        float causticFocus = max( dot( -dropNormal, sunDir2D ), 0.0 );
-        float rimDark = clamp( length( dropNormal ) * 0.55, 0.0, 0.28 );
-
-        col *= ( 1.0 - rimDark * dropMask * 0.45 );
-        col += ( vec3( 0.10 ) + uSunGlowColor * 0.14 ) * causticFocus * dropMask;
-        col += mix( vec3( 1.0 ), uSunGlowColor, 0.55 ) * spec * ( 0.45 + 0.55 * clamp( uLensWetness, 0.0, 1.0 ) );
       }
 
       gl_FragColor = vec4( max( col, vec3( 0.0 ) ), baseTex.a );

@@ -244,7 +244,7 @@ function installWhaleSkinShader(material, shaderUniforms) {
 
         // Parallel cetacean tooth rake-mark scars across flanks & peduncle
         float whaleRakeScars( vec3 rp ) {
-          float flankZone = smoothstep( -5.8, -4.4, rp.z ) * smoothstep( 4.2, 2.2, rp.z ) * smoothstep( -0.55, 0.05, rp.y );
+          float flankZone = smoothstep( -5.8, -4.4, rp.z ) * ( 1.0 - smoothstep( 2.2, 4.2, rp.z ) ) * smoothstep( -0.55, 0.05, rp.y );
           vec2 uvA = vec2( rp.z * 1.45 + rp.y * 0.95, rp.y * 1.65 - rp.z * 0.62 );
           float patchA = smoothstep( 0.63, 0.80, whaleNoise3( vec3( rp * 0.85 + 2.3 ) ) );
           float combA = pow( max( 1e-4, cos( uvA.y * 54.0 + sin( uvA.x * 3.2 ) * 1.4 ) ), 18.0 );
@@ -259,7 +259,7 @@ function installWhaleSkinShader(material, shaderUniforms) {
 
         // Crusty ochre-white Coronula barnacles localized on chin knob, rostrum knobs & flipper leading tubercles
         float whaleBarnacles( vec3 rp ) {
-          float chinZone = smoothstep( 5.65, 6.45, rp.z ) * smoothstep( 0.12, -0.22, rp.y );
+          float chinZone = smoothstep( 5.65, 6.45, rp.z ) * ( 1.0 - smoothstep( -0.22, 0.12, rp.y ) );
           float rostrumTubercleZone = smoothstep( 4.10, 5.10, rp.z ) * smoothstep( -0.05, 0.25, rp.y ) * 0.65;
 
           float absX = abs( rp.x );
@@ -267,7 +267,7 @@ function installWhaleSkinShader(material, shaderUniforms) {
           float wingLeadZ = 1.36 - 2.48 * pow( wingS, 1.06 ) + 0.14 * sin( wingS * 3.14159 );
           float wingLeadDelta = ( rp.z - ( wingLeadZ + 0.34 ) ) / 0.24;
           float flipperLeadZone = smoothstep( 1.05, 1.55, absX )
-            * smoothstep( 4.65, 3.85, absX )
+            * ( 1.0 - smoothstep( 3.85, 4.65, absX ) )
             * exp( -wingLeadDelta * wingLeadDelta );
 
           float zoneMask = max( max( chinZone, rostrumTubercleZone ), flipperLeadZone );
@@ -282,7 +282,7 @@ function installWhaleSkinShader(material, shaderUniforms) {
 
         // Gravity-draining water-runoff streaks when whale is airborne (uWetness < 1.0)
         float whaleRunoffStreaks( vec3 rp, vec3 wp, vec3 wn, float wetness, float time ) {
-          float airborne = smoothstep( 0.995, 0.70, wetness );
+          float airborne = 1.0 - smoothstep( 0.70, 0.995, wetness );
           if ( airborne <= 0.001 ) return 0.0;
           float verticalWall = 1.0 - 0.42 * abs( wn.y );
           float wobble = whaleNoise3( rp * 4.5 + vec3( 0.0, time * 0.35, 0.0 ) ) * 1.4;
@@ -360,17 +360,24 @@ function installWhaleSkinShader(material, shaderUniforms) {
         /* glsl */ `
         #include <normal_fragment_maps>
         {
-          float whRelief = whPoreField * 0.012 + whBarnacleMask * 0.055 - whRakeMask * 0.018 + whStreakMask * 0.010;
+          float restFootprint = length( dFdx( vRestPos ) ) + length( dFdy( vRestPos ) );
+          float fineReliefFade = 1.0 - smoothstep( 0.015, 0.085, restFootprint );
+          float whRelief = ( whPoreField * 0.008 + whStreakMask * 0.007 ) * fineReliefFade
+            + whBarnacleMask * 0.036 * ( 1.0 - smoothstep( 0.05, 0.22, restFootprint ) )
+            - whRakeMask * 0.012 * fineReliefFade;
           vec3 dPosX = dFdx( vViewPosition );
           vec3 dPosY = dFdy( vViewPosition );
-          float dHx = dFdx( whRelief );
-          float dHy = dFdy( whRelief );
+          float maxReliefStep = max( 1e-4, min( length( dPosX ), length( dPosY ) ) * 0.14 );
+          float dHx = clamp( dFdx( whRelief ), -maxReliefStep, maxReliefStep );
+          float dHy = clamp( dFdy( whRelief ), -maxReliefStep, maxReliefStep );
           vec3 r1 = cross( dPosY, normal );
           vec3 r2 = cross( normal, dPosX );
           float det = dot( dPosX, r1 );
-          if ( abs( det ) > 1e-7 ) {
+          float areaScale = max( length( dPosX ) * length( dPosY ), 1e-6 );
+          if ( abs( det ) > areaScale * 0.12 ) {
             vec3 surfGrad = sign( det ) * ( dHx * r1 + dHy * r2 );
-            normal = normalize( abs( det ) * normal - surfGrad );
+            vec3 bumpedNormal = normalize( abs( det ) * normal - surfGrad );
+            normal = normalize( mix( normal, bumpedNormal, 0.55 ) );
           }
         }
         `
@@ -395,7 +402,7 @@ function installWhaleSkinShader(material, shaderUniforms) {
         #include <lights_fragment_end>
         // Animated underwater sunlight caustic light ripples on submerged skin (vWorldPos.y < uWaterLevel)
         if ( vWorldPos.y < uWaterLevel ) {
-          float submergeMask = smoothstep( uWaterLevel, uWaterLevel - 0.35, vWorldPos.y );
+          float submergeMask = 1.0 - smoothstep( uWaterLevel - 0.35, uWaterLevel, vWorldPos.y );
           float waterDepth = max( 0.0, uWaterLevel - vWorldPos.y );
           float depthAtten = exp( -waterDepth * 0.095 );
           vec3 worldN = normalize( vWorldNormal + vec3( 0.0, 1e-6, 0.0 ) );

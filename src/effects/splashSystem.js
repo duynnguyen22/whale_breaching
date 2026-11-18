@@ -152,7 +152,7 @@ function createSprayMaterial(spriteTexture) {
         // Organic mist lobe + ragged liquid ligament breakup on high-velocity sheets
         float lobe = 0.86 + 0.14 * sin(atan(anisoCentered.y, anisoCentered.x + 1e-5) * 5.0 + vSeed * 31.0);
         float ligamentBreakup = 1.0 - fastMask * 0.24 * (0.5 + 0.5 * sin(along * 19.0 + vSeed * 53.0));
-        float alpha = texel.a * vAlpha * ligamentBreakup * smoothstep(1.0, 0.15 * lobe, dist2);
+        float alpha = texel.a * vAlpha * ligamentBreakup * (1.0 - smoothstep(0.15 * lobe, 1.0, dist2));
         if (alpha <= 0.003) discard;
 
         vec3 baseFoam = vec3(0.68, 0.78, 0.84);
@@ -255,7 +255,7 @@ function createSpoutMaterial(spriteTexture) {
         vec4 texel = texture2D(uSprite, clamp(uv, 0.0, 1.0));
 
         float wisp = 0.82 + 0.18 * sin(atan(aniso.y, aniso.x + 1e-5) * 4.0 - uTime * 1.4 + vSeed * 29.0);
-        float alpha = texel.a * vAlpha * smoothstep(1.0, 0.08 * wisp, r2);
+        float alpha = texel.a * vAlpha * (1.0 - smoothstep(0.08 * wisp, 1.0, r2));
         if (alpha <= 0.003) discard;
 
         // Forward-scattered sunlit vapor glow (Mie backlit rim)
@@ -470,8 +470,8 @@ function createUnderwaterSunbeams() {
         float edgeFade = sin(vUv.x * 3.14159265);
         edgeFade = pow(max(0.0, edgeFade), 1.55);
 
-        float topFade = smoothstep(-0.18, -2.3, vWorldY);
-        float depthFade = 1.0 - smoothstep(-5.5, -22.5, vWorldY);
+        float topFade = 1.0 - smoothstep(-2.3, -0.18, vWorldY);
+        float depthFade = smoothstep(-22.5, -5.5, vWorldY);
 
         float ray1 = 0.5 + 0.5 * sin(vUv.x * 19.0 + uTime * 0.92);
         float ray2 = 0.5 + 0.5 * sin(vUv.x * 35.0 - uTime * 1.38);
@@ -654,12 +654,13 @@ function createFoamPatchPool(poolSize = FOAM_PATCH_POOL_SIZE) {
           vec2 p = vUnitPos * 5.5 + vec2(uSeed * 3.1, -uTime * 0.18);
 
           float n = fbm(p) * 0.7 + fbm(p * 2.3 - uTime * 0.25) * 0.3;
-          float ringCenter = mix(0.42, 0.78, uAgeNorm);
+          float ageClamped = clamp(uAgeNorm, 0.0, 1.0);
+          float ringCenter = mix(0.42, 0.78, ageClamped);
           float ringDelta = (r - ringCenter) / 0.22;
           float ringBand = exp(-ringDelta * ringDelta);
-          float innerBoil = (1.0 - smoothstep(0.0, 0.68, r)) * (1.0 - uAgeNorm * 0.65);
+          float innerBoil = (1.0 - smoothstep(0.0, 0.68, r)) * (1.0 - ageClamped * 0.65);
 
-          float lace = smoothstep(0.32 + uAgeNorm * 0.24, 0.82, n * 0.72 + ringBand * 0.58 + innerBoil * 0.42);
+          float lace = smoothstep(0.32 + ageClamped * 0.24, 0.82, n * 0.72 + ringBand * 0.58 + innerBoil * 0.42);
           float outerFade = 1.0 - smoothstep(0.76, 1.0, r);
           float alpha = lace * outerFade * uOpacity;
           if (alpha <= 0.004) discard;
